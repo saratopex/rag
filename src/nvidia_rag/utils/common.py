@@ -368,7 +368,7 @@ def validate_filter_expr(
                 "details": ["Filter expression type mismatch"],
             }
 
-    elif config.vector_store.name == "milvus":
+    elif config.vector_store.name in ("milvus", "lancedb"):
         if isinstance(filter_expr, str):
             logger.debug(
                 f"Validating filter expression: '{filter_expr}' against {len(collection_names)} collections"
@@ -527,7 +527,7 @@ def process_filter_expr(
 
     if not filter_expr or (isinstance(filter_expr, str) and filter_expr.strip() == ""):
         logger.debug("Filter expression is empty, returning empty string/list")
-        return "" if config.vector_store.name == "milvus" else []
+        return "" if config.vector_store.name in ("milvus", "lancedb") else []
 
     logger.debug(
         f"Processing filter expression: '{filter_expr}' for collection '{collection_name}' with vector store '{config.vector_store.name}'"
@@ -557,10 +557,10 @@ def process_filter_expr(
             )
             return []
 
-    elif config.vector_store.name == "milvus":
+    elif config.vector_store.name in ("milvus", "lancedb"):
         if not isinstance(filter_expr, str):
             logger.error(
-                f"Milvus expects string filter, but received: {type(filter_expr)}"
+                f"{config.vector_store.name} expects string filter, but received: {type(filter_expr)}"
             )
             return ""
 

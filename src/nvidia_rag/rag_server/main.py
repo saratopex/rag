@@ -14,16 +14,22 @@
 # limitations under the License.
 
 """This defines the main modules for RAG server which manages the core functionality.
-1. generate(): Generate a response using the RAG chain.
-2. search(): Search for the most relevant documents for the given search parameters.
-3. get_summary(): Get the summary of a document.
 
-Private methods:
-1. __llm_chain: Execute a simple LLM chain using the components defined above.
-2. __rag_chain: Execute a RAG chain using the components defined above.
-3. __print_conversation_history: Print the conversation history.
-4. __normalize_relevance_scores: Normalize the relevance scores of the documents.
-5. __format_document_with_source: Format the document with the source.
+Public async methods:
+1. generate(): Generate a response using the RAG chain (async).
+2. search(): Search for the most relevant documents for the given search parameters (async).
+3. get_summary(): Get the summary of a document (async).
+4. health(): Check the health of dependent services (async).
+
+Private async methods:
+1. _llm_chain(): Execute a simple LLM chain using the components defined above (async).
+2. _rag_chain(): Execute a RAG chain using the components defined above (async).
+
+Private helper methods:
+1. _eager_prefetch_astream(): Eagerly prefetch the first chunk from an async stream.
+2. _print_conversation_history(): Print the conversation history.
+3. _normalize_relevance_scores(): Normalize the relevance scores of the documents.
+4. _format_document_with_source(): Format the document with the source.
 
 """
 
@@ -32,7 +38,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor
 from traceback import print_exc
 from typing import Any
@@ -54,10 +60,11 @@ from nvidia_rag.rag_server.reflection import (
     check_response_groundedness,
 )
 from nvidia_rag.rag_server.response_generator import (
+    APIError,
     Citations,
     ErrorCodeMapping,
     RAGResponse,
-    generate_answer,
+    generate_answer_async,
     prepare_citations,
     prepare_llm_request,
     retrieve_summary,
@@ -73,88 +80,57 @@ from nvidia_rag.rag_server.validation import (
 from nvidia_rag.rag_server.vlm import VLM
 from nvidia_rag.utils.common import (
     filter_documents_by_confidence,
-    get_config,
     process_filter_expr,
     validate_filter_expr,
 )
+from nvidia_rag.utils.configuration import NvidiaRAGConfig
 from nvidia_rag.utils.embedding import get_embedding_model
 from nvidia_rag.utils.filter_expression_generator import (
     generate_filter_from_natural_language,
 )
-from nvidia_rag.utils.llm import get_llm, get_prompts, get_streaming_filter_think_parser
+from nvidia_rag.utils.health_models import RAGHealthResponse
+from nvidia_rag.utils.llm import (
+    get_llm,
+    get_prompts,
+    get_streaming_filter_think_parser_async,
+)
+from nvidia_rag.utils.observability.otel_metrics import OtelMetrics
 from nvidia_rag.utils.reranker import get_ranking_model
 from nvidia_rag.utils.vdb import _get_vdb_op
 from nvidia_rag.utils.vdb.vdb_base import VDBRag
-from observability.otel_metrics import OtelMetrics
+
+
+async def _async_iter(items) -> AsyncGenerator[Any, None]:
+    """Helper to convert a list to an async generator."""
+    for item in items:
+        yield item
+
 
 logger = logging.getLogger(__name__)
-CONFIG = get_config()
-
-# Get the model parameters from the config
-model_params = CONFIG.llm.get_model_parameters()
-default_max_tokens = model_params["max_tokens"]
-default_temperature = model_params["temperature"]
-default_top_p = model_params["top_p"]
-
-document_embedder = get_embedding_model(
-    model=CONFIG.embeddings.model_name, url=CONFIG.embeddings.server_url
-)
-ranker = get_ranking_model(
-    model=CONFIG.ranking.model_name,
-    url=CONFIG.ranking.server_url,
-    top_n=CONFIG.retriever.top_k,
-)
-query_rewriter_llm_config = {"temperature": 0, "top_p": 0.1}
-logger.info(
-    "Query rewriter llm config: model name %s, url %s, config %s",
-    CONFIG.query_rewriter.model_name,
-    CONFIG.query_rewriter.server_url,
-    query_rewriter_llm_config,
-)
-query_rewriter_llm = get_llm(
-    model=CONFIG.query_rewriter.model_name,
-    llm_endpoint=CONFIG.query_rewriter.server_url,
-    **query_rewriter_llm_config,
-)
-
-# Initialize filter expression generator LLM
-filter_generator_llm_config = {
-    "temperature": CONFIG.filter_expression_generator.temperature,
-    "top_p": CONFIG.filter_expression_generator.top_p,
-    "max_tokens": CONFIG.filter_expression_generator.max_tokens,
-}
-
-filter_generator_llm = get_llm(
-    model=CONFIG.filter_expression_generator.model_name,
-    llm_endpoint=CONFIG.filter_expression_generator.server_url,
-    **filter_generator_llm_config,
-)
-
-prompts = get_prompts()
-vdb_top_k = int(CONFIG.retriever.vdb_top_k)
 
 MAX_COLLECTION_NAMES = 5
-
-# Get a StreamingFilterThinkParser based on configuration
-StreamingFilterThinkParser = get_streaming_filter_think_parser()
-
-
-class APIError(Exception):
-    """Custom exception class for API errors."""
-
-    def __init__(self, message: str, code: int = ErrorCodeMapping.BAD_REQUEST):
-        logger.error("APIError occurred: %s with HTTP status: %d", message, code)
-        print_exc()
-        self.message = message
-        self.code = code
-        super().__init__(message)
 
 
 class NvidiaRAG:
     def __init__(
         self,
+        config: NvidiaRAGConfig = None,
         vdb_op: VDBRag = None,
+        prompts: str | dict | None = None,
     ):
+        """Initialize NvidiaRAG with configuration.
+
+        Attempts to initialize all NIM services during startup. If any NIM is unavailable,
+        logs a warning and continues initialization. Unavailable services will return
+        proper error responses at request time.
+
+        Args:
+            config: Configuration object. If None, loads from environment.
+            vdb_op: Optional vector database operator. If None, will be created as needed.
+            prompts: Optional path to a YAML/JSON file or a dictionary of prompts.
+        """
+        # Store config
+        self.config = config or NvidiaRAGConfig()
         self.vdb_op = vdb_op
 
         if self.vdb_op is not None:
@@ -164,25 +140,172 @@ class NvidiaRAG:
                     "Please make sure all the required methods are implemented."
                 )
 
-    async def health(self, check_dependencies: bool = False) -> dict[str, Any]:
+        # Initialize models and utilities from config
+        logger.info("Initializing NvidiaRAG models...")
+
+        # Track initialization errors for runtime reporting
+        self._init_errors = {}
+
+        # Default embedding model
+        try:
+            self.document_embedder = get_embedding_model(
+                model=self.config.embeddings.model_name,
+                url=self.config.embeddings.server_url,
+                config=self.config,
+            )
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.RequestException,
+        ) as e:
+            self.document_embedder = None
+            self._init_errors["embeddings"] = str(e)
+            logger.warning(
+                "Embedding NIM unavailable at %s - will fail at request time: %s",
+                self.config.embeddings.server_url,
+                e,
+            )
+
+        # Default ranker
+        try:
+            self.ranker = get_ranking_model(
+                model=self.config.ranking.model_name,
+                url=self.config.ranking.server_url,
+                top_n=self.config.retriever.top_k,
+                config=self.config,
+            )
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.RequestException,
+        ) as e:
+            self.ranker = None
+            self._init_errors["ranking"] = str(e)
+            logger.warning(
+                "Ranking NIM unavailable at %s - will fail at request time: %s",
+                self.config.ranking.server_url,
+                e,
+            )
+
+        # Query rewriter LLM
+        query_rewriter_llm_config = {
+            "temperature": 0,
+            "top_p": 0.1,
+            "api_key": self.config.query_rewriter.get_api_key(),
+        }
+        # Log config without sensitive api_key
+        safe_config = {k: v for k, v in query_rewriter_llm_config.items() if k != "api_key"}
+        logger.info(
+            "Query rewriter llm config: model name %s, url %s, config %s",
+            self.config.query_rewriter.model_name,
+            self.config.query_rewriter.server_url,
+            safe_config,
+        )
+        try:
+            self.query_rewriter_llm = get_llm(
+                config=self.config,
+                model=self.config.query_rewriter.model_name,
+                llm_endpoint=self.config.query_rewriter.server_url,
+                **query_rewriter_llm_config,
+            )
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.RequestException,
+        ) as e:
+            self.query_rewriter_llm = None
+            self._init_errors["query_rewriter"] = str(e)
+            logger.warning(
+                "Query rewriter NIM unavailable at %s - will fail at request time: %s",
+                self.config.query_rewriter.server_url,
+                e,
+            )
+
+        # Filter expression generator LLM
+        filter_generator_llm_config = {
+            "temperature": self.config.filter_expression_generator.temperature,
+            "top_p": self.config.filter_expression_generator.top_p,
+            "max_tokens": self.config.filter_expression_generator.max_tokens,
+            "api_key": self.config.filter_expression_generator.get_api_key(),
+        }
+        try:
+            self.filter_generator_llm = get_llm(
+                config=self.config,
+                model=self.config.filter_expression_generator.model_name,
+                llm_endpoint=self.config.filter_expression_generator.server_url,
+                **filter_generator_llm_config,
+            )
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.RequestException,
+        ) as e:
+            self.filter_generator_llm = None
+            self._init_errors["filter_generator"] = str(e)
+            logger.warning(
+                "Filter generator NIM unavailable at %s - will fail at request time: %s",
+                self.config.filter_expression_generator.server_url,
+                e,
+            )
+
+        # Load prompts and other utilities
+        self.prompts = get_prompts(prompts)
+        self.vdb_top_k = int(self.config.retriever.vdb_top_k)
+        self.StreamingFilterThinkParser = get_streaming_filter_think_parser_async()
+
+        if self._init_errors:
+            logger.warning(
+                "NvidiaRAG initialization completed with %d unavailable service(s): %s. "
+                "Server will start but requests using these services will fail.",
+                len(self._init_errors),
+                list(self._init_errors.keys()),
+            )
+        else:
+            logger.info("NvidiaRAG initialization complete - all services available")
+
+    @staticmethod
+    async def _eager_prefetch_astream(stream_gen):
+        """
+        Eagerly fetch the first chunk from an async stream to trigger any errors early.
+
+        Args:
+            stream_gen: Async generator to prefetch from
+
+        Returns:
+            Async generator that yields the prefetched chunk followed by the rest
+
+        Raises:
+            StopAsyncIteration: If the stream is empty (converted to empty generator)
+        """
+        try:
+            first_chunk = await stream_gen.__anext__()
+
+            async def complete_stream():
+                yield first_chunk
+                async for chunk in stream_gen:
+                    yield chunk
+
+            return complete_stream()
+        except StopAsyncIteration:
+            logger.warning("LLM produced no output.")
+
+            async def empty_gen():
+                return
+                yield  # Make it an async generator
+
+            return empty_gen()
+
+    async def health(self, check_dependencies: bool = False) -> RAGHealthResponse:
         """Check the health of the RAG server."""
-        response_message = "Service is up."
-        health_results = {}
-        health_results["message"] = response_message
-
-        vdb_op = self.__prepare_vdb_op()
-
         if check_dependencies:
-            dependencies_results = await check_all_services_health(vdb_op)
-            health_results.update(dependencies_results)
-        return health_results
+            vdb_op = self._prepare_vdb_op()
+            return await check_all_services_health(vdb_op, self.config)
 
-    def __prepare_vdb_op(
+        return RAGHealthResponse(message="Service is up.")
+
+    def _prepare_vdb_op(
         self,
-        vdb_endpoint: str = None,
-        embedding_model: str = None,
-        embedding_endpoint: str = None,
-    ):
+        vdb_endpoint: str | None = None,
+        embedding_model: str | None = None,
+        embedding_endpoint: str | None = None,
+        vdb_auth_token: str = "",
+    ) -> VDBRag:
         """
         Prepare the VDBRag object for generation.
         """
@@ -203,13 +326,16 @@ class NvidiaRAG:
             return self.vdb_op
 
         document_embedder = get_embedding_model(
-            model=embedding_model or CONFIG.embeddings.model_name,
-            url=embedding_endpoint or CONFIG.embeddings.server_url,
+            model=embedding_model or self.config.embeddings.model_name,
+            url=embedding_endpoint or self.config.embeddings.server_url,
+            config=self.config,
         )
 
         return _get_vdb_op(
-            vdb_endpoint=vdb_endpoint or CONFIG.vector_store.url,
+            vdb_endpoint=vdb_endpoint or self.config.vector_store.url,
             embedding_model=document_embedder,
+            config=self.config,
+            vdb_auth_token=vdb_auth_token,
         )
 
     def _validate_collections_exist(
@@ -231,39 +357,47 @@ class NvidiaRAG:
                     ErrorCodeMapping.BAD_REQUEST,
                 )
 
-    def generate(
+    async def generate(
         self,
         messages: list[dict[str, Any]],
         use_knowledge_base: bool = True,
-        temperature: float = default_temperature,
-        top_p: float = default_top_p,
-        max_tokens: int = default_max_tokens,
-        stop: list[str] = None,
-        reranker_top_k: int = int(CONFIG.retriever.top_k),
-        vdb_top_k: int = int(CONFIG.retriever.vdb_top_k),
-        vdb_endpoint: str = None,
-        collection_name: str = "",
-        collection_names: list[str] = None,
-        enable_query_rewriting: bool = CONFIG.query_rewriter.enable_query_rewriter,
-        enable_reranker: bool = CONFIG.ranking.enable_reranker,
-        enable_guardrails: bool = CONFIG.enable_guardrails,
-        enable_citations: bool = CONFIG.enable_citations,
-        enable_vlm_inference: bool = CONFIG.enable_vlm_inference,
-        enable_filter_generator: bool = CONFIG.filter_expression_generator.enable_filter_generator,
-        model: str = CONFIG.llm.model_name,
-        llm_endpoint: str = CONFIG.llm.server_url,
-        embedding_model: str = None,
-        embedding_endpoint: str = None,
-        reranker_model: str = CONFIG.ranking.model_name,
-        reranker_endpoint: str = CONFIG.ranking.server_url,
-        vlm_model: str = CONFIG.vlm.model_name,
-        vlm_endpoint: str = CONFIG.vlm.server_url,
+        vdb_auth_token: str = "",
+        temperature: float | None = None,
+        top_p: float | None = None,
+        min_tokens: int | None = None,
+        ignore_eos: bool | None = None,
+        max_tokens: int | None = None,
+        stop: list[str] | None = None,
+        reranker_top_k: int | None = None,
+        vdb_top_k: int | None = None,
+        vdb_endpoint: str | None = None,
+        min_thinking_tokens: int | None = None,
+        max_thinking_tokens: int | None = None,
+        collection_names: list[str] | None = None,
+        enable_query_rewriting: bool | None = None,
+        enable_reranker: bool | None = None,
+        enable_guardrails: bool | None = None,
+        enable_citations: bool | None = None,
+        enable_vlm_inference: bool | None = None,
+        enable_filter_generator: bool | None = None,
+        model: str | None = None,
+        llm_endpoint: str | None = None,
+        embedding_model: str | None = None,
+        embedding_endpoint: str | None = None,
+        reranker_model: str | None = None,
+        reranker_endpoint: str | None = None,
+        vlm_model: str | None = None,
+        vlm_endpoint: str | None = None,
+        vlm_temperature: float | None = None,
+        vlm_top_p: float | None = None,
+        vlm_max_tokens: int | None = None,
+        vlm_max_total_images: int | None = None,
         filter_expr: str | list[dict[str, Any]] = "",
-        enable_query_decomposition: bool = CONFIG.query_decomposition.enable_query_decomposition,
-        confidence_threshold: float = CONFIG.default_confidence_threshold,
+        enable_query_decomposition: bool | None = None,
+        confidence_threshold: float | None = None,
         rag_start_time_sec: float | None = None,
         metrics: OtelMetrics | None = None,
-    ) -> Generator[str, None, None]:
+    ) -> AsyncGenerator[str, None]:
         """Execute a Retrieval Augmented Generation chain using the components defined above.
         It's called when the `/generate` API is invoked with `use_knowledge_base` set to `True` or `False`.
 
@@ -272,11 +406,12 @@ class NvidiaRAG:
             use_knowledge_base: Whether to use knowledge base for generation
             temperature: Sampling temperature for generation
             top_p: Top-p sampling mass
+            min_tokens: Minimum tokens to generate
+            ignore_eos: Whether to generate tokens after the EOS token is generated
             max_tokens: Maximum tokens to generate
             stop: List of stop sequences
             reranker_top_k: Number of documents to return after reranking
             vdb_top_k: Number of documents to retrieve from vector DB
-            collection_name: Name of the collection to use
             collection_names: List of collection names to use
             enable_query_rewriting: Whether to enable query rewriting
             enable_reranker: Whether to enable reranking
@@ -288,11 +423,93 @@ class NvidiaRAG:
             reranker_endpoint: Reranker server endpoint URL
             filter_expr: Filter expression to filter document from vector DB
         """
+        # Apply defaults from config for None values
+        model_params = self.config.llm.get_model_parameters()
+        temperature = (
+            temperature if temperature is not None else model_params["temperature"]
+        )
+        top_p = top_p if top_p is not None else model_params["top_p"]
+        min_tokens = (
+            min_tokens if min_tokens is not None else model_params["min_tokens"]
+        )
+        ignore_eos = (
+            ignore_eos if ignore_eos is not None else model_params["ignore_eos"]
+        )
+        max_tokens = (
+            max_tokens if max_tokens is not None else model_params["max_tokens"]
+        )
+        reranker_top_k = (
+            reranker_top_k
+            if reranker_top_k is not None
+            else self.config.retriever.top_k
+        )
+        vdb_top_k = (
+            vdb_top_k if vdb_top_k is not None else self.config.retriever.vdb_top_k
+        )
+        enable_query_rewriting = (
+            enable_query_rewriting
+            if enable_query_rewriting is not None
+            else self.config.query_rewriter.enable_query_rewriter
+        )
+        enable_reranker = (
+            enable_reranker
+            if enable_reranker is not None
+            else self.config.ranking.enable_reranker
+        )
+        enable_guardrails = (
+            enable_guardrails
+            if enable_guardrails is not None
+            else self.config.enable_guardrails
+        )
+        enable_citations = (
+            enable_citations
+            if enable_citations is not None
+            else self.config.enable_citations
+        )
+        enable_vlm_inference = (
+            enable_vlm_inference
+            if enable_vlm_inference is not None
+            else self.config.enable_vlm_inference
+        )
+        enable_filter_generator = (
+            enable_filter_generator
+            if enable_filter_generator is not None
+            else self.config.filter_expression_generator.enable_filter_generator
+        )
+        model = model if model is not None else self.config.llm.model_name
+        llm_endpoint = (
+            llm_endpoint if llm_endpoint is not None else self.config.llm.server_url
+        )
+        reranker_model = (
+            reranker_model
+            if reranker_model is not None
+            else self.config.ranking.model_name
+        )
+        reranker_endpoint = (
+            reranker_endpoint
+            if reranker_endpoint is not None
+            else self.config.ranking.server_url
+        )
+        vlm_model = vlm_model if vlm_model is not None else self.config.vlm.model_name
+        vlm_endpoint = (
+            vlm_endpoint if vlm_endpoint is not None else self.config.vlm.server_url
+        )
+        enable_query_decomposition = (
+            enable_query_decomposition
+            if enable_query_decomposition is not None
+            else self.config.query_decomposition.enable_query_decomposition
+        )
+        confidence_threshold = (
+            confidence_threshold
+            if confidence_threshold is not None
+            else self.config.default_confidence_threshold
+        )
 
-        vdb_op = self.__prepare_vdb_op(
+        vdb_op = self._prepare_vdb_op(
             vdb_endpoint=vdb_endpoint,
             embedding_model=embedding_model,
             embedding_endpoint=embedding_endpoint,
+            vdb_auth_token=vdb_auth_token,
         )
 
         # Validate boolean and float parameters
@@ -324,7 +541,7 @@ class NvidiaRAG:
         if stop is None:
             stop = []
         if collection_names is None:
-            collection_names = [CONFIG.vector_store.default_collection_name]
+            collection_names = [self.config.vector_store.default_collection_name]
 
         query, chat_history = prepare_llm_request(messages)
         llm_settings = {
@@ -332,27 +549,54 @@ class NvidiaRAG:
             "llm_endpoint": llm_endpoint,
             "temperature": temperature,
             "top_p": top_p,
+            "min_tokens": min_tokens,
+            "ignore_eos": ignore_eos,
             "max_tokens": max_tokens,
+            "min_thinking_tokens": min_thinking_tokens,
+            "max_thinking_tokens": max_thinking_tokens,
             "enable_guardrails": enable_guardrails,
             "stop": stop,
         }
 
+        # Resolve VLM overrides to concrete values (fall back to config when None)
+        vlm_temperature = (
+            vlm_temperature
+            if vlm_temperature is not None
+            else self.config.vlm.temperature
+        )
+        vlm_top_p = vlm_top_p if vlm_top_p is not None else self.config.vlm.top_p
+        vlm_max_tokens = (
+            vlm_max_tokens if vlm_max_tokens is not None else self.config.vlm.max_tokens
+        )
+        vlm_max_total_images = (
+            vlm_max_total_images
+            if vlm_max_total_images is not None
+            else self.config.vlm.max_total_images
+        )
+
+        vlm_settings = {
+            "vlm_model": vlm_model,
+            "vlm_endpoint": vlm_endpoint,
+            "vlm_temperature": vlm_temperature,
+            "vlm_top_p": vlm_top_p,
+            "vlm_max_tokens": vlm_max_tokens,
+            "vlm_max_total_images": vlm_max_total_images,
+        }
+
         if use_knowledge_base:
             logger.info("Using knowledge base to generate response.")
-            return self.__rag_chain(
+            return await self._rag_chain(
                 llm_settings=llm_settings,
                 query=query,
                 chat_history=chat_history,
                 reranker_top_k=reranker_top_k,
                 vdb_top_k=vdb_top_k,
-                collection_name=collection_name,
                 collection_names=collection_names,
                 enable_reranker=enable_reranker,
                 reranker_model=reranker_model,
                 reranker_endpoint=reranker_endpoint,
                 enable_vlm_inference=enable_vlm_inference,
-                vlm_model=vlm_model,
-                vlm_endpoint=vlm_endpoint,
+                vlm_settings=vlm_settings,
                 model=model,
                 enable_query_rewriting=enable_query_rewriting,
                 enable_citations=enable_citations,
@@ -368,44 +612,43 @@ class NvidiaRAG:
             logger.info(
                 "Using LLM to generate response directly without knowledge base."
             )
-            return self.__llm_chain(
+            return await self._llm_chain(
                 llm_settings=llm_settings,
                 query=query,
                 chat_history=chat_history,
                 model=model,
-                collection_name=collection_name,
                 enable_citations=enable_citations,
                 metrics=metrics,
             )
 
-    def search(
+    async def search(
         self,
-        query: str,
-        messages: list[dict[str, str]] = None,
-        reranker_top_k: int = int(CONFIG.retriever.top_k),
-        vdb_top_k: int = int(CONFIG.retriever.vdb_top_k),
-        collection_name: str = "",
-        collection_names: list[str] = None,
-        vdb_endpoint: str = None,
-        enable_query_rewriting: bool = CONFIG.query_rewriter.enable_query_rewriter,
-        enable_reranker: bool = CONFIG.ranking.enable_reranker,
-        enable_filter_generator: bool = CONFIG.filter_expression_generator.enable_filter_generator,
-        embedding_model: str = None,
-        embedding_endpoint: str = None,
-        reranker_model: str = CONFIG.ranking.model_name,
-        reranker_endpoint: str | None = CONFIG.ranking.server_url,
+        query: str | list[dict[str, Any]],
+        messages: list[dict[str, str]] | None = None,
+        reranker_top_k: int | None = None,
+        vdb_top_k: int | None = None,
+        collection_names: list[str] | None = None,
+        vdb_endpoint: str | None = None,
+        vdb_auth_token: str = "",
+        enable_query_rewriting: bool | None = None,
+        enable_reranker: bool | None = None,
+        enable_filter_generator: bool | None = None,
+        embedding_model: str | None = None,
+        embedding_endpoint: str | None = None,
+        reranker_model: str | None = None,
+        reranker_endpoint: str | None = None,
         filter_expr: str | list[dict[str, Any]] = "",
-        confidence_threshold: float = CONFIG.default_confidence_threshold,
+        confidence_threshold: float | None = None,
+        enable_citations: bool | None = None,
     ) -> Citations:
         """Search for the most relevant documents for the given search parameters.
         It's called when the `/search` API is invoked.
 
         Args:
-            query (str): Query to be searched from vectorstore.
+            query (str | list[dict[str, Any]]): Query to be searched from vectorstore. Can be a string or multimodal content with text and images.
             messages (List[Dict[str, str]]): List of chat messages for context.
             reranker_top_k (int): Number of document chunks to retrieve after reranking.
             vdb_top_k (int): Number of top results to retrieve from vector database.
-            collection_name (str): Name of the collection to be searched from vectorstore.
             collection_names (List[str]): List of collection names to be searched from vectorstore.
             vdb_endpoint (str): Endpoint URL of the vector database server.
             enable_query_rewriting (bool): Whether to enable query rewriting.
@@ -419,18 +662,67 @@ class NvidiaRAG:
             Citations: Retrieved documents.
         """
 
-        logger.info("Searching relevant document for the query: %s", query)
+        logger.info(
+            "Searching relevant document for the query: %s",
+            self._extract_text_from_content(query),
+        )
 
-        vdb_op = self.__prepare_vdb_op(
+        # Apply defaults from config for None values
+        reranker_top_k = (
+            reranker_top_k
+            if reranker_top_k is not None
+            else self.config.retriever.top_k
+        )
+        vdb_top_k = (
+            vdb_top_k if vdb_top_k is not None else self.config.retriever.vdb_top_k
+        )
+        enable_query_rewriting = (
+            enable_query_rewriting
+            if enable_query_rewriting is not None
+            else self.config.query_rewriter.enable_query_rewriter
+        )
+        enable_reranker = (
+            enable_reranker
+            if enable_reranker is not None
+            else self.config.ranking.enable_reranker
+        )
+        enable_filter_generator = (
+            enable_filter_generator
+            if enable_filter_generator is not None
+            else self.config.filter_expression_generator.enable_filter_generator
+        )
+        reranker_model = (
+            reranker_model
+            if reranker_model is not None
+            else self.config.ranking.model_name
+        )
+        reranker_endpoint = (
+            reranker_endpoint
+            if reranker_endpoint is not None
+            else self.config.ranking.server_url
+        )
+        confidence_threshold = (
+            confidence_threshold
+            if confidence_threshold is not None
+            else self.config.default_confidence_threshold
+        )
+        enable_citations = (
+            enable_citations
+            if enable_citations is not None
+            else self.config.enable_citations
+        )
+
+        vdb_op = self._prepare_vdb_op(
             vdb_endpoint=vdb_endpoint,
             embedding_model=embedding_model,
             embedding_endpoint=embedding_endpoint,
+            vdb_auth_token=vdb_auth_token,
         )
 
         if messages is None:
             messages = []
         if collection_names is None:
-            collection_names = [CONFIG.vector_store.default_collection_name]
+            collection_names = [self.config.vector_store.default_collection_name]
 
         # Validate top_k parameters
         vdb_top_k = validate_vdb_top_k(vdb_top_k)
@@ -443,12 +735,6 @@ class NvidiaRAG:
         )
 
         try:
-            if collection_name:  # Would be deprecated in the future
-                logger.warning(
-                    "'collection_name' parameter is provided. This will be deprecated in the future. Use 'collection_names' instead."
-                )
-                collection_names = [collection_name]
-
             if not collection_names:
                 raise APIError(
                     "Collection names are not provided.", ErrorCodeMapping.BAD_REQUEST
@@ -489,7 +775,7 @@ class NvidiaRAG:
                 }
             else:
                 validation_result = validate_filter_expr(
-                    filter_expr, collection_names, metadata_schemas
+                    filter_expr, collection_names, metadata_schemas, config=self.config
                 )
 
             if not validation_result["status"]:
@@ -528,7 +814,10 @@ class NvidiaRAG:
                 def process_filter_for_collection(collection_name):
                     metadata_schema_data = metadata_schemas.get(collection_name)
                     processed_filter_expr = process_filter_expr(
-                        filter_expr, collection_name, metadata_schema_data
+                        filter_expr,
+                        collection_name,
+                        metadata_schema_data,
+                        config=self.config,
                     )
                     logger.debug(
                         f"Filter expression processed for collection '{collection_name}': '{filter_expr}' -> '{processed_filter_expr}'"
@@ -548,116 +837,196 @@ class NvidiaRAG:
                         )
 
             docs = []
-            local_ranker = get_ranking_model(
-                model=reranker_model, url=reranker_endpoint, top_n=reranker_top_k
-            )
+            local_ranker = None
+            if enable_reranker:
+                try:
+                    local_ranker = get_ranking_model(
+                        model=reranker_model,
+                        url=reranker_endpoint,
+                        top_n=reranker_top_k,
+                        config=self.config,
+                    )
+                except APIError:
+                    # Re-raise APIError as-is
+                    raise
+                except (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.RequestException,
+                    ConnectionError,
+                    OSError,
+                ) as e:
+                    # Wrap connection errors from reranker service
+                    reranker_url = reranker_endpoint or self.config.ranking.server_url
+                    error_msg = f"Reranker NIM unavailable at {reranker_url}. Please verify the service is running and accessible."
+                    logger.error("Connection error in reranker initialization: %s", e)
+                    raise APIError(
+                        error_msg,
+                        ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                    ) from e
+
             top_k = vdb_top_k if local_ranker and enable_reranker else reranker_top_k
             logger.info("Setting top k as: %s.", top_k)
 
-            retriever_query = query
+            # Build retriever query from multimodal content (similar to generate method)
+            retriever_query, is_image_query = self._build_retriever_query_from_content(
+                query
+            )
             # Query used for specific tasks (filter generation, reflection) - stays clean without history concatenation
             processed_query = retriever_query
 
             # Handle multi-turn conversations with two different strategies:
             # 1. Query rewriting: Creates a standalone, context-aware query (good for both retrieval and tasks)
             # 2. Query combination: Concatenates history for retrieval, keeps original for specific tasks
-            if messages:
-                if enable_query_rewriting:
-                    # conversation is tuple so it should be multiple of two
-                    # -1 is to keep last k conversation
-                    history_count = (
-                        int(os.environ.get("CONVERSATION_HISTORY", 15)) * 2 * -1
-                    )
-                    messages = messages[history_count:]
-                    conversation_history = []
+            if messages and not is_image_query:
+                # Check CONVERSATION_HISTORY setting
+                conversation_history_count = int(
+                    os.environ.get("CONVERSATION_HISTORY", 0)
+                )
 
-                    for message in messages:
-                        if message.get("role") != "system":
-                            conversation_history.append(
-                                (message.get("role"), message.get("content"))
+                if enable_query_rewriting:
+                    # Skip query rewriting if conversation history is disabled
+                    if conversation_history_count == 0:
+                        logger.warning(
+                            "Query rewriting is enabled but CONVERSATION_HISTORY is set to 0. "
+                            "Query rewriting requires conversation history to work effectively. "
+                            "Skipping query rewriting. Set CONVERSATION_HISTORY > 0 to enable query rewriting."
+                        )
+                    # Check if query rewriter is available (fails early if not)
+                    elif self.query_rewriter_llm is None:
+                        raise APIError(
+                            "Query rewriting is enabled but the query rewriter NIM is unavailable. "
+                            f"Please verify the service is running at {self.config.query_rewriter.server_url}.",
+                            ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                        )
+                    else:
+                        # conversation is tuple so it should be multiple of two
+                        # -1 is to keep last k conversation
+                        history_count = conversation_history_count * 2 * -1
+                        messages = messages[history_count:]
+                        conversation_history = []
+
+                        for message in messages:
+                            if message.get("role") != "system":
+                                conversation_history.append(
+                                    (message.get("role"), message.get("content"))
+                                )
+
+                        # Based on conversation history recreate query for better
+                        # document retrieval
+                        contextualize_q_system_prompt = (
+                            "Given a chat history and the latest user question "
+                            "which might reference context in the chat history, "
+                            "formulate a standalone question which can be understood "
+                            "without the chat history. Do NOT answer the question, "
+                            "just reformulate it if needed and otherwise return it as is."
+                        )
+                        query_rewriter_prompt_config = self.prompts.get(
+                            "query_rewriter_prompt", {}
+                        )
+                        system_prompt = query_rewriter_prompt_config.get(
+                            "system", contextualize_q_system_prompt
+                        )
+                        human_prompt = query_rewriter_prompt_config.get(
+                            "human", "{input}"
+                        )
+
+                        # Format conversation history as a string
+                        formatted_history = ""
+                        if conversation_history:
+                            formatted_history = "\n".join(
+                                [
+                                    f"{role.capitalize()}: {content}"
+                                    for role, content in conversation_history
+                                ]
                             )
 
-                    # Based on conversation history recreate query for better
-                    # document retrieval
-                    contextualize_q_system_prompt = (
-                        "Given a chat history and the latest user question "
-                        "which might reference context in the chat history, "
-                        "formulate a standalone question which can be understood "
-                        "without the chat history. Do NOT answer the question, "
-                        "just reformulate it if needed and otherwise return it as is."
-                    )
-                    query_rewriter_prompt_config = prompts.get(
-                        "query_rewriter_prompt", {}
-                    )
-                    system_prompt = query_rewriter_prompt_config.get(
-                        "system", contextualize_q_system_prompt
-                    )
-                    human_prompt = query_rewriter_prompt_config.get("human", "{input}")
-
-                    # Format conversation history as a string
-                    formatted_history = ""
-                    if conversation_history:
-                        formatted_history = "\n".join(
+                        contextualize_q_prompt = ChatPromptTemplate.from_messages(
                             [
-                                f"{role.capitalize()}: {content}"
-                                for role, content in conversation_history
+                                ("system", system_prompt),
+                                ("human", human_prompt),
                             ]
                         )
-
-                    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-                        [
-                            ("system", system_prompt),
-                            ("human", human_prompt),
-                        ]
-                    )
-                    q_prompt = (
-                        contextualize_q_prompt
-                        | query_rewriter_llm
-                        | StreamingFilterThinkParser
-                        | StrOutputParser()
-                    )
-
-                    # Log the complete prompt that will be sent to LLM
-                    try:
-                        formatted_prompt = contextualize_q_prompt.format_messages(
-                            input=query, chat_history=formatted_history
+                        q_prompt = (
+                            contextualize_q_prompt
+                            | self.query_rewriter_llm
+                            | self.StreamingFilterThinkParser
+                            | StrOutputParser()
                         )
-                        logger.info("Complete query rewriter prompt sent to LLM:")
-                        for i, message in enumerate(formatted_prompt):
-                            logger.info(
-                                "  Message %d [%s]: %s",
-                                i,
-                                message.type,
-                                message.content,
+
+                        # Log the complete prompt that will be sent to LLM
+                        try:
+                            formatted_prompt = contextualize_q_prompt.format_messages(
+                                input=query, chat_history=formatted_history
                             )
-                    except Exception as e:
-                        logger.warning("Could not format prompt for logging: %s", e)
+                            logger.info("Complete query rewriter prompt sent to LLM:")
+                            for i, message in enumerate(formatted_prompt):
+                                logger.info(
+                                    "  Message %d [%s]: %s",
+                                    i,
+                                    message.type,
+                                    message.content,
+                                )
+                        except Exception as e:
+                            logger.warning("Could not format prompt for logging: %s", e)
 
-                    retriever_query = q_prompt.invoke(
-                        {"input": query, "chat_history": formatted_history}
-                    )
-                    logger.info("Rewritten Query: %s", retriever_query)
+                        try:
+                            retriever_query = await q_prompt.ainvoke(
+                                {"input": query, "chat_history": formatted_history}
+                            )
+                        except (ConnectionError, OSError, Exception) as e:
+                            # Wrap connection errors from query rewriter LLM
+                            if isinstance(e, APIError):
+                                raise
+                            query_rewriter_url = self.config.query_rewriter.server_url
+                            endpoint_msg = (
+                                f" at {query_rewriter_url}"
+                                if query_rewriter_url
+                                else ""
+                            )
+                            raise APIError(
+                                f"Query rewriter LLM NIM unavailable{endpoint_msg}. Please verify the service is running and accessible or disable query rewriting.",
+                                ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                            ) from e
 
-                    # When query rewriting is enabled, we can use it as processed_query for other modules
-                    processed_query = retriever_query
+                        logger.info("Rewritten Query: %s", retriever_query)
+
+                        # When query rewriting is enabled, we can use it as processed_query for other modules
+                        processed_query = retriever_query
                 else:
                     # Query combination strategy: Concatenate history for better retrieval context
                     # Note: processed_query remains unchanged (original query) for clean task processing
-                    user_queries = [
-                        msg.get("content")
-                        for msg in messages
-                        if msg.get("role") == "user"
-                    ]
-                    retriever_query = ". ".join([*user_queries, query])
-                    logger.info("Combined retriever query: %s", retriever_query)
+                    if self.config.query_rewriter.multiturn_retrieval_simple:
+                        user_queries = [
+                            msg.get("content")
+                            for msg in messages
+                            if msg.get("role") == "user"
+                        ]
+                        retriever_query = ". ".join(
+                            [*user_queries, self._extract_text_from_content(query)]
+                        )
+                        logger.info("Combined retriever query: %s", retriever_query)
+                    else:
+                        # Use only the current query, ignore conversation history
+                        logger.info(
+                            "Using only current query: %s for retrieval (conversation history disabled)",
+                            retriever_query,
+                        )
 
-            if enable_filter_generator:
-                if CONFIG.vector_store.name != "milvus":
+            if enable_filter_generator and not is_image_query:
+                if self.config.vector_store.name not in ("milvus", "lancedb"):
                     logger.warning(
-                        f"Filter expression generator is currently only supported for Milvus. "
-                        f"Current vector store: {CONFIG.vector_store.name}. Skipping filter generation."
+                        f"Filter expression generator is currently only supported for Milvus and LanceDB. "
+                        f"Current vector store: {self.config.vector_store.name}. Skipping filter generation."
                     )
                 else:
+                    # Check if filter generator LLM is available (fails early if not)
+                    if self.filter_generator_llm is None:
+                        raise APIError(
+                            "Filter expression generator is enabled but the filter generator NIM is unavailable. "
+                            f"Please verify the service is running at {self.config.filter_expression_generator.server_url}.",
+                            ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                        )
+
                     logger.debug(
                         "Filter expression generator enabled, attempting to generate filter from query"
                     )
@@ -674,10 +1043,10 @@ class NvidiaRAG:
                                         user_request=processed_query,
                                         collection_name=collection_name,
                                         metadata_schema=metadata_schema_data,
-                                        prompt_template=prompts.get(
+                                        prompt_template=self.prompts.get(
                                             "filter_expression_generator_prompt"
                                         ),
-                                        llm=filter_generator_llm,
+                                        llm=self.filter_generator_llm,
                                         existing_filter_expr=filter_expr,
                                     )
                                 )
@@ -692,6 +1061,7 @@ class NvidiaRAG:
                                         collection_name,
                                         metadata_schema_data,
                                         is_generated_filter=True,
+                                        config=self.config,
                                     )
                                     return collection_name, processed_filter_expr
                                 else:
@@ -743,9 +1113,8 @@ class NvidiaRAG:
 
             # Get relevant documents with optional reflection
             otel_ctx = otel_context.get_current()
-            if os.environ.get("ENABLE_REFLECTION", "false").lower() == "true":
-                max_loops = int(os.environ.get("MAX_REFLECTION_LOOP", 3))
-                reflection_counter = ReflectionCounter(max_loops)
+            if self.config.reflection.enable_reflection:
+                reflection_counter = ReflectionCounter(self.config.reflection.max_loops)
                 docs, is_relevant = check_context_relevance(
                     vdb_op=vdb_op,
                     retriever_query=processed_query,
@@ -755,9 +1124,10 @@ class NvidiaRAG:
                     top_k=top_k,
                     enable_reranker=enable_reranker,
                     collection_filter_mapping=collection_filter_mapping,
+                    config=self.config,
                 )
                 if local_ranker and enable_reranker:
-                    docs = self.__normalize_relevance_scores(docs)
+                    docs = self._normalize_relevance_scores(docs)
                     if confidence_threshold > 0.0:
                         docs = filter_documents_by_confidence(
                             documents=docs,
@@ -767,12 +1137,11 @@ class NvidiaRAG:
                     logger.warning(
                         "Could not find sufficiently relevant context after maximum attempts"
                     )
-                return prepare_citations(retrieved_documents=docs, force_citations=True)
+                return prepare_citations(retrieved_documents=docs, force_citations=True, enable_citations=enable_citations)
             else:
-                if local_ranker and enable_reranker:
+                if local_ranker and enable_reranker and not is_image_query:
                     logger.info(
-                        "Narrowing the collection from %s results and further narrowing it to %s with the reranker for rag"
-                        " chain.",
+                        "Narrowing the collection from %s results and further narrowing it to %s with the reranker for search",
                         top_k,
                         reranker_top_k,
                     )
@@ -817,17 +1186,32 @@ class NvidiaRAG:
                             docs.extend(future.result())
 
                     context_reranker_start_time = time.time()
-                    docs = context_reranker.invoke(
-                        {"context": docs, "question": processed_query},
-                        config={"run_name": "context_reranker"},
-                    )
+                    try:
+                        docs = await context_reranker.ainvoke(
+                            {"context": docs, "question": processed_query},
+                            config={"run_name": "context_reranker"},
+                        )
+                    except (
+                        requests.exceptions.ConnectionError,
+                        ConnectionError,
+                        OSError,
+                    ) as e:
+                        reranker_url = (
+                            reranker_endpoint or self.config.ranking.server_url
+                        )
+                        error_msg = f"Reranker NIM unavailable at {reranker_url}. Please verify the service is running and accessible."
+                        logger.error("Connection error in reranker: %s", e)
+                        raise APIError(
+                            error_msg, ErrorCodeMapping.SERVICE_UNAVAILABLE
+                        ) from e
+
                     logger.info(
                         "    == Context reranker time: %.2f ms ==",
                         (time.time() - context_reranker_start_time) * 1000,
                     )
 
                     # Normalize scores to 0-1 range"
-                    docs = self.__normalize_relevance_scores(docs.get("context", []))
+                    docs = self._normalize_relevance_scores(docs.get("context", []))
                     if confidence_threshold > 0.0:
                         docs = filter_documents_by_confidence(
                             documents=docs,
@@ -835,22 +1219,48 @@ class NvidiaRAG:
                         )
 
                     return prepare_citations(
-                        retrieved_documents=docs, force_citations=True
+                        retrieved_documents=docs, force_citations=True, enable_citations=enable_citations
+                    )
+                else:
+                    # Handle case where reranker is disabled or image query
+                    if is_image_query:
+                        docs = vdb_op.retrieval_image_langchain(
+                            query=retriever_query,
+                            collection_name=validated_collections[0],
+                            vectorstore=vdb_op.get_langchain_vectorstore(
+                                validated_collections[0]
+                            ),
+                            top_k=top_k,
+                            # Note: Filter expressions may not be supported for image queries
+                            # filter_expr=collection_filter_mapping.get(validated_collections[0], ""),
+                            # otel_ctx=otel_ctx,
+                        )
+                    else:
+                        docs = vdb_op.retrieval_langchain(
+                            query=retriever_query,
+                            collection_name=validated_collections[0],
+                            vectorstore=vdb_op.get_langchain_vectorstore(
+                                validated_collections[0]
+                            ),
+                            top_k=top_k,
+                            filter_expr=collection_filter_mapping.get(
+                                validated_collections[0], ""
+                            ),
+                            otel_ctx=otel_ctx,
+                        )
+                    return prepare_citations(
+                        retrieved_documents=docs, force_citations=True, enable_citations=enable_citations
                     )
 
-            docs = vdb_op.retrieval_langchain(
-                query=retriever_query,
-                collection_name=validated_collections[0],
-                vectorstore=vdb_op.get_langchain_vectorstore(validated_collections[0]),
-                top_k=top_k,
-                filter_expr=collection_filter_mapping.get(validated_collections[0], ""),
-                otel_ctx=otel_ctx,
-            )
-            # TODO: Check how to get the relevance score from milvus
-            return prepare_citations(retrieved_documents=docs, force_citations=True)
-
+        except APIError:
+            # Re-raise APIError as-is to preserve status_code
+            raise
         except Exception as e:
-            raise APIError(f"Failed to search documents. {str(e)}") from e
+            # Only wrap non-APIError exceptions - default to 500 for unexpected errors
+            raise APIError(
+                f"Failed to search documents. {str(e)}",
+                ErrorCodeMapping.INTERNAL_SERVER_ERROR,
+            ) from e
 
     @staticmethod
     async def get_summary(
@@ -895,9 +1305,9 @@ class NvidiaRAG:
         """
 
         # Get the base template
-        system_prompt = prompts.get(template_key, {}).get("system", "")
+        system_prompt = self.prompts.get(template_key, {}).get("system", "")
         # Support both "human" and "user" keys with fallback
-        template_dict = prompts.get(template_key, {})
+        template_dict = self.prompts.get(template_key, {})
         user_prompt = template_dict.get("human", template_dict.get("user", ""))
         conversation_history = []
         user_message = []
@@ -934,16 +1344,15 @@ class NvidiaRAG:
             user_message,
         )
 
-    def __llm_chain(
+    async def _llm_chain(
         self,
         llm_settings: dict[str, Any],
         query: str | list[dict[str, Any]],
         chat_history: list[dict[str, Any]],
         model: str = "",
-        collection_name: str = "",
         enable_citations: bool = True,
         metrics: OtelMetrics | None = None,
-    ) -> Generator[str, None, None]:
+    ) -> AsyncGenerator[str, None]:
         """Execute a simple LLM chain using the components defined above.
         It's called when the `/generate` API is invoked with `use_knowledge_base` set to `False`.
 
@@ -952,15 +1361,18 @@ class NvidiaRAG:
             query: The user's query
             chat_history: List of conversation messages
             model: Name of the model used for generation
-            collection_name: Name of the collection used for retrieval
             enable_citations: Whether to enable citations in the response
         """
         try:
             # Limit conversation history to prevent overwhelming the model
             # conversation is tuple so it should be multiple of two
             # -1 is to keep last k conversation
-            history_count = int(os.environ.get("CONVERSATION_HISTORY", 15)) * 2 * -1
-            chat_history = chat_history[history_count:]
+            conversation_history_count = int(os.environ.get("CONVERSATION_HISTORY", 0))
+            if conversation_history_count == 0:
+                chat_history = []
+            else:
+                history_count = conversation_history_count * 2 * -1
+                chat_history = chat_history[history_count:]
 
             # Use the new prompt processing method
             (
@@ -997,22 +1409,30 @@ class NvidiaRAG:
             # Add user query
             message += user_query
 
-            self.__print_conversation_history(message, query_text)
+            self._print_conversation_history(message, query_text)
 
             prompt_template = ChatPromptTemplate.from_messages(message)
-            llm = get_llm(**llm_settings)
+            llm = get_llm(config=self.config, **llm_settings)
 
             chain = (
-                prompt_template | llm | StreamingFilterThinkParser | StrOutputParser()
+                prompt_template
+                | llm
+                | self.StreamingFilterThinkParser
+                | StrOutputParser()
             )
+            # Create async stream generator
+            stream_gen = chain.astream(
+                {"question": query_text}, config={"run_name": "llm-stream"}
+            )
+            # Eagerly fetch first chunk to trigger any errors before returning response
+            prefetched_stream = await self._eager_prefetch_astream(stream_gen)
+
             return RAGResponse(
-                generate_answer(
-                    chain.stream(
-                        {"question": query_text}, config={"run_name": "llm-stream"}
-                    ),
+                generate_answer_async(
+                    prefetched_stream,
                     [],
                     model=model,
-                    collection_name=collection_name,
+                    collection_name="",
                     enable_citations=enable_citations,
                     otel_metrics_client=metrics,
                 ),
@@ -1023,39 +1443,63 @@ class NvidiaRAG:
                 "Connection timed out while making a request to the LLM endpoint: %s", e
             )
             return RAGResponse(
-                generate_answer(
-                    iter(
+                generate_answer_async(
+                    _async_iter(
                         [
                             "Connection timed out while making a request to the NIM endpoint. Verify if the NIM server is available."
                         ]
                     ),
                     [],
                     model=model,
-                    collection_name=collection_name,
+                    collection_name="",
                     enable_citations=enable_citations,
                     otel_metrics_client=metrics,
                 ),
                 status_code=ErrorCodeMapping.REQUEST_TIMEOUT,
             )
 
+        except (requests.exceptions.ConnectionError, ConnectionError, OSError):
+            # Fallback for uncaught LLM connection errors
+            llm_url = llm_settings.get("llm_endpoint") or self.config.llm.server_url
+            error_msg = f"LLM NIM unavailable at {llm_url}. Please verify the service is running and accessible."
+            logger.exception("Connection error (LLM)")
+            return RAGResponse(
+                generate_answer_async(
+                    _async_iter([error_msg]),
+                    [],
+                    model=model,
+                    collection_name="",
+                    enable_citations=enable_citations,
+                    otel_metrics_client=metrics,
+                ),
+                status_code=ErrorCodeMapping.SERVICE_UNAVAILABLE,
+            )
+
         except Exception as e:
-            logger.warning("Failed to generate response due to exception %s", e)
-            print_exc()
+            # Extract just the error type and message for cleaner logs
+            error_msg = str(e).split("\n")[0] if "\n" in str(e) else str(e)
+            logger.warning(
+                "Failed to generate response due to exception: %s", error_msg
+            )
+
+            # Only show full traceback at DEBUG level
+            if logger.getEffectiveLevel() <= logging.DEBUG:
+                print_exc()
 
             if "[403] Forbidden" in str(e) and "Invalid UAM response" in str(e):
                 logger.warning(
                     "Authentication or permission error: Verify the validity and permissions of your NVIDIA API key."
                 )
                 return RAGResponse(
-                    generate_answer(
-                        iter(
+                    generate_answer_async(
+                        _async_iter(
                             [
                                 "Authentication or permission error: Verify the validity and permissions of your NVIDIA API key."
                             ]
                         ),
                         [],
                         model=model,
-                        collection_name=collection_name,
+                        collection_name="",
                         enable_citations=enable_citations,
                         otel_metrics_client=metrics,
                     ),
@@ -1067,11 +1511,11 @@ class NvidiaRAG:
                 logger.warning(f"Model not found: {error_msg}")
 
                 return RAGResponse(
-                    generate_answer(
-                        iter([error_msg]),
+                    generate_answer_async(
+                        _async_iter([error_msg]),
                         [],
                         model=model,
-                        collection_name=collection_name,
+                        collection_name="",
                         enable_citations=enable_citations,
                         otel_metrics_client=metrics,
                     ),
@@ -1079,11 +1523,11 @@ class NvidiaRAG:
                 )
             else:
                 return RAGResponse(
-                    generate_answer(
-                        iter([f"{str(e)}"]),
+                    generate_answer_async(
+                        _async_iter([str(e)]),
                         [],
                         model=model,
-                        collection_name=collection_name,
+                        collection_name="",
                         enable_citations=enable_citations,
                         otel_metrics_client=metrics,
                     ),
@@ -1128,7 +1572,7 @@ class NvidiaRAG:
                     return True
         return False
 
-    def _build_retriever_query_from_content(self, content: Any) -> str:
+    def _build_retriever_query_from_content(self, content: Any) -> tuple[str, bool]:
         """Build retriever query from either string or multimodal content.
         For multimodal content, includes both text and base64 images for VLM embedding support.
 
@@ -1136,10 +1580,11 @@ class NvidiaRAG:
             content: Either a string or a list of content objects (multimodal)
 
         Returns:
-            str: Query string that may include base64 image data for VLM embeddings
+            tuple[str, bool]: Query string that may include base64 image data for VLM embeddings
+            bool: True if image URL is provided, False otherwise
         """
         if isinstance(content, str):
-            return content
+            return content, False
         elif isinstance(content, list):
             # Build multimodal query with both text and base64 images
             query_parts = []
@@ -1152,39 +1597,38 @@ class NvidiaRAG:
                     elif item.get("type") == "image_url":
                         image_url = item.get("image_url", {}).get("url", "")
                         if image_url:
-                            # Include the base64 image data for VLM embedding
-                            query_parts.append(image_url)
-            return "\n\n".join(query_parts)
+                            # If image URL is provided, return it as is
+                            return image_url, True
+            # If no image URL is provided, return the text content
+            return "\n\n".join(query_parts), False
         else:
             # Fallback for any other content type
-            return str(content) if content is not None else ""
+            return (str(content) if content is not None else ""), False
 
-    def __rag_chain(
+    async def _rag_chain(
         self,
         llm_settings: dict[str, Any],
         query: str | list[dict[str, Any]],
         chat_history: list[dict[str, Any]],
         reranker_top_k: int = 10,
         vdb_top_k: int = 40,
-        collection_name: str = "",
-        collection_names: list[str] = None,
+        collection_names: list[str] | None = None,
         enable_reranker: bool = True,
         reranker_model: str = "",
         reranker_endpoint: str | None = None,
         enable_vlm_inference: bool = False,
-        vlm_model: str = "",
-        vlm_endpoint: str = "",
+        vlm_settings: dict[str, Any] | None = None,
         model: str = "",
         enable_query_rewriting: bool = False,
         enable_citations: bool = True,
         filter_expr: str | list[dict[str, Any]] | None = "",
         enable_filter_generator: bool = False,
-        vdb_op: VDBRag = None,
+        vdb_op: VDBRag | None = None,
         enable_query_decomposition: bool = False,
-        confidence_threshold: float = CONFIG.default_confidence_threshold,
+        confidence_threshold: float | None = None,
         rag_start_time_sec: float | None = None,
         metrics: OtelMetrics | None = None,
-    ) -> tuple[Generator[str, None, None], list[dict[str, Any]]]:
+    ) -> tuple[AsyncGenerator[str, None], list[dict[str, Any]]]:
         """Execute a RAG chain using the components defined above.
         It's called when the `/generate` API is invoked with `use_knowledge_base` set to `True`.
 
@@ -1194,7 +1638,6 @@ class NvidiaRAG:
             chat_history: List of conversation messages
             reranker_top_k: Number of documents to return after reranking
             vdb_top_k: Number of documents to retrieve from vector DB
-            collection_name: Name of the collection to use
             collection_names: List of collection names to use
             embedding_model: Name of the embedding model
             embedding_endpoint: Embedding server endpoint URL
@@ -1216,13 +1659,13 @@ class NvidiaRAG:
         )
 
         try:
-            # If collection_name is provided, use it as the collection name,
-            # Otherwise, use the collection names from the kwargs
-            if collection_name:  # Would be deprecated in the future
-                logger.warning(
-                    "'collection_name' parameter is provided. This will be deprecated in the future. Use 'collection_names' instead."
-                )
-                collection_names = [collection_name]
+            # Apply default from config for None value
+            confidence_threshold = (
+                confidence_threshold
+                if confidence_threshold is not None
+                else self.config.default_confidence_threshold
+            )
+
             # Check if collection names are provided
             if not collection_names:
                 raise APIError(
@@ -1261,7 +1704,7 @@ class NvidiaRAG:
                 }
             else:
                 validation_result = validate_filter_expr(
-                    filter_expr, collection_names, metadata_schemas
+                    filter_expr, collection_names, metadata_schemas, config=self.config
                 )
 
             if not validation_result["status"]:
@@ -1301,7 +1744,10 @@ class NvidiaRAG:
                     # Use cached metadata schema to avoid duplicate API call
                     metadata_schema_data = metadata_schemas.get(collection_name)
                     processed_filter_expr = process_filter_expr(
-                        filter_expr, collection_name, metadata_schema_data
+                        filter_expr,
+                        collection_name,
+                        metadata_schema_data,
+                        config=self.config,
                     )
                     logger.debug(
                         f"Filter expression processed for collection '{collection_name}': '{filter_expr}' -> '{processed_filter_expr}'"
@@ -1320,18 +1766,53 @@ class NvidiaRAG:
                             processed_filter_expr
                         )
 
-            llm = get_llm(**llm_settings)
+            # LLM and ranker creation - let the existing exception handler at the bottom catch runtime errors
+            llm = get_llm(config=self.config, **llm_settings)
             logger.info("Ranker enabled: %s", enable_reranker)
-            ranker = get_ranking_model(
-                model=reranker_model, url=reranker_endpoint, top_n=reranker_top_k
-            )
+
+            # Try to get ranking model if reranker is enabled
+            ranker = None
+            if enable_reranker:
+                try:
+                    ranker = get_ranking_model(
+                        model=reranker_model,
+                        url=reranker_endpoint,
+                        top_n=reranker_top_k,
+                        config=self.config,
+                    )
+                except (
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.RequestException,
+                ) as e:
+                    service_url = (
+                        reranker_endpoint
+                        or reranker_model
+                        or self.config.ranking.server_url
+                    )
+                    raise APIError(
+                        f"Ranking NIM unavailable at {service_url}. "
+                        f"Please verify the service is running and accessible.",
+                        ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                    ) from e
+
             top_k = vdb_top_k if ranker and enable_reranker else reranker_top_k
             logger.info("Setting retriever top k as: %s.", top_k)
 
             # conversation is tuple so it should be multiple of two
             # -1 is to keep last k conversation
-            history_count = int(os.environ.get("CONVERSATION_HISTORY", 15)) * 2 * -1
-            chat_history = chat_history[history_count:]
+            conversation_history_count = int(os.environ.get("CONVERSATION_HISTORY", 0))
+            if conversation_history_count == 0:
+                chat_history = []
+                # Warn if query rewriting is enabled but conversation history is disabled
+                if enable_query_rewriting:
+                    logger.warning(
+                        "Query rewriting is enabled but CONVERSATION_HISTORY is set to 0. "
+                        "Query rewriting requires conversation history to work effectively. "
+                        "Skipping query rewriting. Set CONVERSATION_HISTORY > 0 to enable query rewriting."
+                    )
+            else:
+                history_count = conversation_history_count * 2 * -1
+                chat_history = chat_history[history_count:]
             retrieval_time_ms = None
             context_reranker_time_ms = None
 
@@ -1341,111 +1822,163 @@ class NvidiaRAG:
                 conversation_history,
                 user_message,
             ) = self._handle_prompt_processing(chat_history, model, "rag_template")
-            vlm_message = []
             logger.debug("System message: %s", system_message)
             logger.debug("User message: %s", user_message)
             logger.debug("Conversation history: %s", conversation_history)
-            # Build retriever query from multimodal content (includes text and base64 images for VLM embedding)
-            retriever_query = self._build_retriever_query_from_content(query)
+            # for multimoda query only image is used for retrieval
+            retriever_query, is_image_query = self._build_retriever_query_from_content(
+                query
+            )
             # Query used for specific tasks (filter generation, reflection) - stays clean without history concatenation
             processed_query = retriever_query
 
             # Handle multi-turn conversations with two different strategies:
             # 1. Query rewriting: Creates a standalone, context-aware query (good for both retrieval and tasks)
             # 2. Query combination: Concatenates history for retrieval, keeps original for specific tasks
-            if chat_history:
+            if chat_history and not is_image_query:
                 if enable_query_rewriting:
-                    # Based on conversation history recreate query for better
-                    # document retrieval
-                    contextualize_q_system_prompt = (
-                        "Given a chat history and the latest user question "
-                        "which might reference context in the chat history, "
-                        "formulate a standalone question which can be understood "
-                        "without the chat history. Do NOT answer the question, "
-                        "just reformulate it if needed and otherwise return it as is."
-                    )
-                    query_rewriter_prompt_config = prompts.get(
-                        "query_rewriter_prompt", {}
-                    )
-                    system_prompt = query_rewriter_prompt_config.get(
-                        "system", contextualize_q_system_prompt
-                    )
-                    human_prompt = query_rewriter_prompt_config.get("human", "{input}")
+                    # Skip query rewriting if conversation history is disabled
+                    if conversation_history_count == 0:
+                        logger.warning(
+                            "Query rewriting is enabled but CONVERSATION_HISTORY is set to 0. "
+                            "Query rewriting requires conversation history to work effectively. "
+                            "Skipping query rewriting. Set CONVERSATION_HISTORY > 0 to enable query rewriting."
+                        )
+                    # Check if query rewriter is available (fails early if not)
+                    # Only check if we actually need it (CONVERSATION_HISTORY > 0)
+                    elif self.query_rewriter_llm is None:
+                        raise APIError(
+                            "Query rewriting is enabled but the query rewriter NIM is unavailable. "
+                            f"Please verify the service is running at {self.config.query_rewriter.server_url}.",
+                            ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                        )
+                    else:
+                        # Based on conversation history recreate query for better
+                        # document retrieval
+                        contextualize_q_system_prompt = (
+                            "Given a chat history and the latest user question "
+                            "which might reference context in the chat history, "
+                            "formulate a standalone question which can be understood "
+                            "without the chat history. Do NOT answer the question, "
+                            "just reformulate it if needed and otherwise return it as is."
+                        )
+                        query_rewriter_prompt_config = self.prompts.get(
+                            "query_rewriter_prompt", {}
+                        )
+                        system_prompt = query_rewriter_prompt_config.get(
+                            "system", contextualize_q_system_prompt
+                        )
+                        human_prompt = query_rewriter_prompt_config.get(
+                            "human", "{input}"
+                        )
 
-                    # Format conversation history as a string
-                    formatted_history = ""
-                    if conversation_history:
-                        formatted_history = "\n".join(
+                        # Format conversation history as a string
+                        formatted_history = ""
+                        if conversation_history:
+                            formatted_history = "\n".join(
+                                [
+                                    f"{role.capitalize()}: {content}"
+                                    for role, content in conversation_history
+                                ]
+                            )
+
+                        contextualize_q_prompt = ChatPromptTemplate.from_messages(
                             [
-                                f"{role.capitalize()}: {content}"
-                                for role, content in conversation_history
+                                ("system", system_prompt),
+                                ("human", human_prompt),
                             ]
                         )
-
-                    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-                        [
-                            ("system", system_prompt),
-                            ("human", human_prompt),
-                        ]
-                    )
-                    q_prompt = (
-                        contextualize_q_prompt
-                        | query_rewriter_llm
-                        | StreamingFilterThinkParser
-                        | StrOutputParser()
-                    )
-                    # query to be used for document retrieval
-                    # logger.info("Query rewriter prompt: %s", contextualize_q_prompt)
-
-                    # Log the complete prompt that will be sent to LLM
-                    try:
-                        formatted_prompt = contextualize_q_prompt.format_messages(
-                            input=retriever_query, chat_history=formatted_history
+                        q_prompt = (
+                            contextualize_q_prompt
+                            | self.query_rewriter_llm
+                            | self.StreamingFilterThinkParser
+                            | StrOutputParser()
                         )
-                        logger.info("Complete query rewriter prompt sent to LLM:")
-                        for i, message in enumerate(formatted_prompt):
-                            logger.info(
-                                "  Message %d [%s]: %s",
-                                i,
-                                message.type,
-                                message.content,
+                        # query to be used for document retrieval
+                        # logger.info("Query rewriter prompt: %s", contextualize_q_prompt)
+
+                        # Log the complete prompt that will be sent to LLM
+                        try:
+                            formatted_prompt = contextualize_q_prompt.format_messages(
+                                input=retriever_query, chat_history=formatted_history
                             )
-                    except Exception as e:
-                        logger.warning("Could not format prompt for logging: %s", e)
+                            logger.info("Complete query rewriter prompt sent to LLM:")
+                            for i, message in enumerate(formatted_prompt):
+                                logger.info(
+                                    "  Message %d [%s]: %s",
+                                    i,
+                                    message.type,
+                                    message.content,
+                                )
+                        except Exception as e:
+                            logger.warning("Could not format prompt for logging: %s", e)
 
-                    retriever_query = q_prompt.invoke(
-                        {
-                            "input": retriever_query,
-                            "chat_history": formatted_history,
-                        },
-                        config={"run_name": "query-rewriter"},
-                    )
-                    logger.info(
-                        "Rewritten Query: %s %s", retriever_query, len(retriever_query)
-                    )
+                        try:
+                            retriever_query = await q_prompt.ainvoke(
+                                {
+                                    "input": retriever_query,
+                                    "chat_history": formatted_history,
+                                },
+                                config={"run_name": "query-rewriter"},
+                            )
+                        except (ConnectionError, OSError, Exception) as e:
+                            # Wrap connection errors from query rewriter LLM
+                            if isinstance(e, APIError):
+                                raise
+                            query_rewriter_url = self.config.query_rewriter.server_url
+                            endpoint_msg = (
+                                f" at {query_rewriter_url}"
+                                if query_rewriter_url
+                                else ""
+                            )
+                            raise APIError(
+                                f"Query rewriter LLM NIM unavailable{endpoint_msg}. Please verify the service is running and accessible or disable query rewriting.",
+                                ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                            ) from e
 
-                    # When query rewriting is enabled, we can use it as processed_query for other modules
-                    processed_query = retriever_query
+                        logger.info(
+                            "Rewritten Query: %s %s",
+                            retriever_query,
+                            len(retriever_query),
+                        )
+
+                        # When query rewriting is enabled, we can use it as processed_query for other modules
+                        processed_query = retriever_query
                 else:
                     # Query combination strategy: Concatenate history for better retrieval context
                     # Note: processed_query remains unchanged (original query) for clean task processing
-                    user_queries = [
-                        self._build_retriever_query_from_content(msg.get("content"))
-                        for msg in chat_history
-                        if msg.get("role") == "user"
-                    ][-1:]
-                    # TODO: Find a better way to join this when queries already
-                    # have punctuation
-                    retriever_query = ". ".join([*user_queries, retriever_query])
-                    logger.info("Combined retriever query: %s", retriever_query)
+                    if self.config.query_rewriter.multiturn_retrieval_simple:
+                        user_query_results = [
+                            self._build_retriever_query_from_content(msg.get("content"))
+                            for msg in chat_history
+                            if msg.get("role") == "user"
+                        ][-1:]
+                        # Extract just the query strings from the tuples
+                        user_queries = [query for query, _ in user_query_results]
+                        retriever_query = ". ".join([*user_queries, retriever_query])
+                        logger.info("Combined retriever query: %s", retriever_query)
+                    else:
+                        # Use only the current query, ignore conversation history
+                        logger.info(
+                            "Using only current query %s for retrieval (conversation history disabled)",
+                            retriever_query,
+                        )
 
-            if enable_filter_generator:
-                if CONFIG.vector_store.name != "milvus":
+            if enable_filter_generator and not is_image_query:
+                if self.config.vector_store.name not in ("milvus", "lancedb"):
                     logger.warning(
-                        f"Filter expression generator is currently only supported for Milvus. "
-                        f"Current vector store: {CONFIG.vector_store.name}. Skipping filter generation."
+                        f"Filter expression generator is currently only supported for Milvus and LanceDB. "
+                        f"Current vector store: {self.config.vector_store.name}. Skipping filter generation."
                     )
                 else:
+                    # Check if filter generator LLM is available (fails early if not)
+                    if self.filter_generator_llm is None:
+                        raise APIError(
+                            "Filter expression generator is enabled but the filter generator NIM is unavailable. "
+                            f"Please verify the service is running at {self.config.filter_expression_generator.server_url}.",
+                            ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                        )
+
                     logger.debug(
                         "Filter expression generator enabled, attempting to generate filter from query"
                     )
@@ -1462,10 +1995,10 @@ class NvidiaRAG:
                                         user_request=processed_query,
                                         collection_name=collection_name,
                                         metadata_schema=metadata_schema_data,
-                                        prompt_template=prompts.get(
+                                        prompt_template=self.prompts.get(
                                             "filter_expression_generator_prompt"
                                         ),
-                                        llm=filter_generator_llm,
+                                        llm=self.filter_generator_llm,
                                         existing_filter_expr=filter_expr,
                                     )
                                 )
@@ -1479,6 +2012,7 @@ class NvidiaRAG:
                                         collection_name,
                                         metadata_schema_data,
                                         is_generated_filter=True,
+                                        config=self.config,
                                     )
                                     return collection_name, processed_filter_expr
                                 else:
@@ -1521,16 +2055,16 @@ class NvidiaRAG:
                     except Exception as e:
                         logger.warning(f"Error generating filter expression: {str(e)}")
 
-            if enable_query_decomposition:
+            if enable_query_decomposition and not is_image_query:
                 logger.info("Using query decomposition for complex query processing")
                 # TODO: Pass processed_query instead of query and check accuracy
-                return iterative_query_decomposition(
+                return await iterative_query_decomposition(
                     query=query,
                     history=conversation_history,
                     llm=llm,
                     vdb_op=vdb_op,
                     ranker=ranker if enable_reranker else None,
-                    recursion_depth=CONFIG.query_decomposition.recursion_depth,
+                    recursion_depth=self.config.query_decomposition.recursion_depth,
                     enable_citations=enable_citations,
                     collection_name=validated_collections[0]
                     if validated_collections
@@ -1539,6 +2073,7 @@ class NvidiaRAG:
                     ranker_top_k=reranker_top_k,
                     confidence_threshold=confidence_threshold,
                     llm_settings=llm_settings,
+                    prompts=self.prompts,
                 )
 
             if confidence_threshold > 0.0 and not enable_reranker:
@@ -1549,24 +2084,45 @@ class NvidiaRAG:
                 )
 
             # Get relevant documents with optional reflection
-            if os.environ.get("ENABLE_REFLECTION", "false").lower() == "true":
-                max_loops = int(os.environ.get("MAX_REFLECTION_LOOP", 3))
-                reflection_counter = ReflectionCounter(max_loops)
+            if self.config.reflection.enable_reflection:
+                reflection_counter = ReflectionCounter(self.config.reflection.max_loops)
 
-                context_to_show, is_relevant = check_context_relevance(
-                    vdb_op=vdb_op,
-                    retriever_query=processed_query,
-                    collection_names=validated_collections,
-                    ranker=ranker,
-                    reflection_counter=reflection_counter,
-                    top_k=top_k,
-                    enable_reranker=enable_reranker,
-                    collection_filter_mapping=collection_filter_mapping,
-                )
+                try:
+                    context_to_show, is_relevant = await check_context_relevance(
+                        vdb_op=vdb_op,
+                        retriever_query=processed_query,
+                        collection_names=validated_collections,
+                        ranker=ranker,
+                        reflection_counter=reflection_counter,
+                        top_k=top_k,
+                        enable_reranker=enable_reranker,
+                        collection_filter_mapping=collection_filter_mapping,
+                        config=self.config,
+                        prompts=self.prompts,
+                    )
+                except (
+                    ConnectionError,
+                    OSError,
+                    requests.exceptions.ConnectionError,
+                ) as e:
+                    # Wrap connection errors from reflection LLM with proper message
+                    reflection_llm_endpoint = self.config.reflection.server_url
+                    endpoint_msg = (
+                        f" at {reflection_llm_endpoint}"
+                        if reflection_llm_endpoint
+                        else ""
+                    )
+                    raise APIError(
+                        f"Reflection LLM NIM unavailable{endpoint_msg}. Please verify the service is running and accessible or disable reflection.",
+                        ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                    ) from e
+                except APIError:
+                    # Re-raise APIError as-is
+                    raise
 
                 # Normalize scores to 0-1 range
                 if ranker and enable_reranker:
-                    context_to_show = self.__normalize_relevance_scores(context_to_show)
+                    context_to_show = self._normalize_relevance_scores(context_to_show)
 
                 if not is_relevant:
                     logger.warning(
@@ -1575,7 +2131,8 @@ class NvidiaRAG:
                     )
             else:
                 otel_ctx = otel_context.get_current()
-                if ranker and enable_reranker:
+                # Current reranker is not supported for image query
+                if ranker and enable_reranker and not is_image_query:
                     logger.info(
                         "Narrowing the collection from %s results and further narrowing it to "
                         "%s with the reranker for rag chain.",
@@ -1632,10 +2189,25 @@ class NvidiaRAG:
                     logger.debug(
                         "Using processed query for reranker %s", processed_query
                     )
-                    docs = context_reranker.invoke(
-                        {"context": docs, "question": processed_query},
-                        config={"run_name": "context_reranker"},
-                    )
+                    try:
+                        docs = await context_reranker.ainvoke(
+                            {"context": docs, "question": processed_query},
+                            config={"run_name": "context_reranker"},
+                        )
+                    except (
+                        requests.exceptions.ConnectionError,
+                        ConnectionError,
+                        OSError,
+                    ) as e:
+                        reranker_url = (
+                            reranker_endpoint or self.config.ranking.server_url
+                        )
+                        error_msg = f"Reranker NIM unavailable at {reranker_url}. Please verify the service is running and accessible."
+                        logger.error("Connection error in reranker: %s", e)
+                        raise APIError(
+                            error_msg, ErrorCodeMapping.SERVICE_UNAVAILABLE
+                        ) from e
+
                     context_reranker_time_ms = (
                         time.time() - context_reranker_start_time
                     ) * 1000
@@ -1645,23 +2217,38 @@ class NvidiaRAG:
                     )
                     context_to_show = docs.get("context", [])
                     # Normalize scores to 0-1 range
-                    context_to_show = self.__normalize_relevance_scores(context_to_show)
+                    context_to_show = self._normalize_relevance_scores(context_to_show)
                 else:
                     # Multiple retrievers are not supported when reranking is disabled
                     retrieval_start_time = time.time()
-                    docs = vdb_op.retrieval_langchain(
-                        query=retriever_query,
-                        collection_name=validated_collections[0],
-                        vectorstore=vdb_op.get_langchain_vectorstore(
-                            validated_collections[0]
-                        ),
-                        top_k=top_k,
-                        filter_expr=collection_filter_mapping.get(
-                            validated_collections[0], ""
-                        ),
-                        otel_ctx=otel_ctx,
-                    )
-                    context_to_show = docs
+                    if is_image_query:
+                        docs = vdb_op.retrieval_image_langchain(
+                            query=retriever_query,
+                            collection_name=validated_collections[0],
+                            vectorstore=vdb_op.get_langchain_vectorstore(
+                                validated_collections[0]
+                            ),
+                            top_k=top_k,
+                            # filter_expr=collection_filter_mapping.get(
+                            #     validated_collections[0], ""
+                            # ),
+                            # otel_ctx=otel_ctx,
+                        )
+                        context_to_show = docs
+                    else:
+                        docs = vdb_op.retrieval_langchain(
+                            query=retriever_query,
+                            collection_name=validated_collections[0],
+                            vectorstore=vdb_op.get_langchain_vectorstore(
+                                validated_collections[0]
+                            ),
+                            top_k=top_k,
+                            filter_expr=collection_filter_mapping.get(
+                                validated_collections[0], ""
+                            ),
+                            otel_ctx=otel_ctx,
+                        )
+                        context_to_show = docs
                     retrieval_time_ms = (time.time() - retrieval_start_time) * 1000
 
             if ranker and enable_reranker and confidence_threshold > 0.0:
@@ -1670,9 +2257,15 @@ class NvidiaRAG:
                     confidence_threshold=confidence_threshold,
                 )
 
-            if enable_vlm_inference:
-                # Fast pre-check: skip VLM entirely if no images in query or context
+            if enable_vlm_inference or is_image_query:
+                # Initialize vlm_settings if not provided
+                vlm_settings = vlm_settings or {}
+                # Fast pre-check: determine where images are present
                 has_images_in_query = self._contains_images(query)
+                has_images_in_history = any(
+                    self._contains_images(m.get("content")) for m in chat_history or []
+                )
+                has_images_in_messages = has_images_in_query or has_images_in_history
                 has_images_in_context = False
                 try:
                     for d in context_to_show:
@@ -1685,85 +2278,118 @@ class NvidiaRAG:
                     # If metadata inspection fails, be conservative and proceed
                     has_images_in_context = False
 
-                if not (has_images_in_query or has_images_in_context):
-                    logger.warning(
-                        "Skipping VLM: no images found in query or retrieved context."
+                # Control whether we are allowed to silently fall back to LLM when no images are present
+                vlm_to_llm_fallback = getattr(self.config, "vlm_to_llm_fallback", True)
+
+                # Decide if we should call VLM:
+                # - Always when any images are present (messages, context, or explicit image query)
+                # - Additionally, when VLM_TO_LLM_FALLBACK is disabled, even if no images are present
+                should_call_vlm = (
+                    has_images_in_messages
+                    or has_images_in_context
+                    or is_image_query
+                    or not vlm_to_llm_fallback
+                )
+
+                if should_call_vlm:
+                    logger.info(
+                        "Calling VLM (has_images_in_messages=%s, has_images_in_context=%s, "
+                        "is_image_query=%s, vlm_to_llm_fallback=%s)",
+                        has_images_in_messages,
+                        has_images_in_context,
+                        is_image_query,
+                        vlm_to_llm_fallback,
                     )
-                    # fall through without VLM
-                else:
-                    logger.info("Calling VLM to analyze images cited in the context")
-                    vlm_response: str = ""
                     try:
-                        vlm = VLM(vlm_model, vlm_endpoint)
-                        vlm_response = vlm.analyze_images_from_context(
-                            context_to_show, query
+                        # Resolve all VLM settings to concrete values (no None)
+                        vlm_model_cfg = (
+                            vlm_settings.get("vlm_model") or self.config.vlm.model_name
+                        )
+                        vlm_endpoint_cfg = (
+                            vlm_settings.get("vlm_endpoint")
+                            or self.config.vlm.server_url
+                        )
+                        vlm_temperature_cfg = (
+                            vlm_settings.get("vlm_temperature")
+                            or self.config.vlm.temperature
+                        )
+                        vlm_top_p_cfg = (
+                            vlm_settings.get("vlm_top_p") or self.config.vlm.top_p
+                        )
+                        vlm_max_tokens_cfg = (
+                            vlm_settings.get("vlm_max_tokens")
+                            or self.config.vlm.max_tokens
+                        )
+                        vlm_max_total_images_cfg = (
+                            vlm_settings.get("vlm_max_total_images")
+                            or self.config.vlm.max_total_images
                         )
 
-                        vlm_response_stripped = (
-                            vlm_response.strip()
-                            if isinstance(vlm_response, str)
-                            else ""
+                        vlm = VLM(
+                            vlm_model=vlm_model_cfg,
+                            vlm_endpoint=vlm_endpoint_cfg,
+                            config=self.config,
+                            prompts=self.prompts,
                         )
-                        if vlm_response_stripped:
-                            if CONFIG.vlm.enable_vlm_response_reasoning:
-                                should_use_vlm_response = vlm.reason_on_vlm_response(
-                                    query,
-                                    vlm_response_stripped,
-                                    context_to_show,
-                                    llm_settings,
-                                )
-                            else:
-                                # Reasoning gate disabled: always include VLM output
-                                should_use_vlm_response = True
+                        # Build full messages: prior history + current query as a final user turn
+                        vlm_messages = [
+                            *(chat_history or []),
+                            {"role": "user", "content": query},
+                        ]
+                        # Build textual context identical to LLM "context" (before mutation below)
+                        vlm_text_context = "\n\n".join(
+                            [
+                                self._format_document_with_source(d)
+                                for d in context_to_show
+                            ]
+                        )
+                        # Always stream VLM response directly using async streaming (reasoning gate deprecated)
+                        logger.info("Streaming VLM response directly (async).")
+                        vlm_generator = vlm.stream_with_messages(
+                            docs=context_to_show,
+                            messages=vlm_messages,
+                            context_text=vlm_text_context,
+                            question_text=self._extract_text_from_content(query),
+                            temperature=vlm_temperature_cfg,
+                            top_p=vlm_top_p_cfg,
+                            max_tokens=vlm_max_tokens_cfg,
+                            max_total_images=vlm_max_total_images_cfg,
+                        )
+                        # Eagerly prefetch first chunk to trigger any errors before creating RAGResponse
+                        # ensures connection errors are caught early
+                        prefetched_vlm_stream = await self._eager_prefetch_astream(
+                            vlm_generator
+                        )
 
-                            # If query contains images, or vlm_response_as_final_answer is enabled, return as final answer
-                            if should_use_vlm_response and (
-                                CONFIG.vlm.vlm_response_as_final_answer
-                                or self._contains_images(query)
-                            ):
-                                logger.info(
-                                    "VLM response as final answer: %s",
-                                    vlm_response_stripped,
-                                )
-                                return RAGResponse(
-                                    generate_answer(
-                                        iter([vlm_response_stripped]),
-                                        context_to_show,
-                                        model=model,
-                                        collection_name=collection_name,
-                                        enable_citations=enable_citations,
-                                    ),
-                                    status_code=ErrorCodeMapping.SUCCESS,
-                                )
-                            else:
-                                logger.info("Query type: %s", type(query))
-                                logger.info(
-                                    "VLM response not as final answer: %s",
-                                    vlm_response_stripped,
-                                )
-
-                            if should_use_vlm_response:
-                                logger.info(
-                                    "VLM response validated and added to prompt: %s",
-                                    vlm_response_stripped,
-                                )
-                                injection_tmpl = prompts.get(
-                                    "vlm_response_injection_template",
-                                    "The following is an answer generated by a Vision-Language Model (VLM) based solely on images cited in the context:\n---\n{vlm_response}\n---\nConsider this visual insight when answering the user's query, especially where the textual context is ambiguous or limited.",
-                                )
-                                vlm_response_prompt = injection_tmpl.format(
-                                    vlm_response=vlm_response_stripped
-                                )
-                                vlm_message += [("user", vlm_response_prompt)]
-                            else:
-                                logger.info("VLM response skipped by reasoning gate.")
-                        else:
-                            logger.info("VLM response is empty.")
-                    except (OSError, ValueError) as e:
+                        return RAGResponse(
+                            generate_answer_async(
+                                prefetched_vlm_stream,
+                                context_to_show,
+                                model=model,
+                                collection_name=validated_collections[0] if validated_collections else "",
+                                enable_citations=enable_citations,
+                            ),
+                            status_code=ErrorCodeMapping.SUCCESS,
+                        )
+                    except APIError as e:
+                        # Catch APIError from VLM (raised during eager prefetch) and return with correct status code
+                        logger.warning("APIError from VLM in _rag_chain: %s", e.message)
+                        return RAGResponse(
+                            generate_answer_async(
+                                _async_iter([e.message]),
+                                [],
+                                model=model,
+                                collection_name=validated_collections[0] if validated_collections else "",
+                                enable_citations=enable_citations,
+                                otel_metrics_client=metrics,
+                            ),
+                            status_code=e.status_code,
+                        )
+                    except (OSError, ValueError, ConnectionError) as e:
                         logger.warning(
                             "VLM processing failed for query='%s', collection='%s': %s",
                             query,
-                            collection_name,
+                            validated_collections[0] if validated_collections else "",
                             e,
                             exc_info=True,
                         )
@@ -1778,7 +2404,7 @@ class NvidiaRAG:
                         logger.error(
                             "Unexpected error during VLM processing for query='%s', collection='%s': %s",
                             query,
-                            collection_name,
+                            validated_collections[0] if validated_collections else "",
                             e,
                             exc_info=True,
                         )
@@ -1788,8 +2414,14 @@ class NvidiaRAG:
                         raise APIError(
                             vlm_error_msg, ErrorCodeMapping.BAD_REQUEST
                         ) from e
+                else:
+                    # No images found and VLM_TO_LLM_FALLBACK is enabled: skip VLM and continue with standard LLM RAG flow.
+                    logger.info(
+                        "Skipping VLM because no images are present and VLM_TO_LLM_FALLBACK is enabled; "
+                        "falling back to regular LLM flow."
+                    )
 
-            docs = [self.__format_document_with_source(d) for d in context_to_show]
+            docs = [self._format_document_with_source(d) for d in context_to_show]
 
             # Prompt for response generation based on context
             message = system_message + user_message
@@ -1804,37 +2436,63 @@ class NvidiaRAG:
                 )
                 message += [("user", f"Conversation history:\n{formatted_history}")]
 
-            # Add vlm response and user query to prompt
-            message += vlm_message
+            # Add user query to prompt
             user_query = [("user", "Query: {question}\n\nAnswer: ")]
             message += user_query
 
-            self.__print_conversation_history(message)
+            self._print_conversation_history(message)
             prompt = ChatPromptTemplate.from_messages(message)
 
-            chain = prompt | llm | StreamingFilterThinkParser | StrOutputParser()
+            chain = prompt | llm | self.StreamingFilterThinkParser | StrOutputParser()
 
             # Check response groundedness if we still have reflection
             # iterations available
             if (
-                os.environ.get("ENABLE_REFLECTION", "false").lower() == "true"
+                self.config.reflection.enable_reflection
                 and reflection_counter.remaining > 0
             ):
-                initial_response = chain.invoke({"question": query, "context": docs})
-                final_response, is_grounded = check_response_groundedness(
-                    query, initial_response, docs, reflection_counter
+                initial_response = await chain.ainvoke(
+                    {"question": query, "context": docs}
                 )
+                try:
+                    final_response, is_grounded = await check_response_groundedness(
+                        query,
+                        initial_response,
+                        docs,
+                        reflection_counter,
+                        config=self.config,
+                        prompts=self.prompts,
+                    )
+                except (
+                    ConnectionError,
+                    OSError,
+                    requests.exceptions.ConnectionError,
+                ) as e:
+                    # Wrap connection errors from reflection LLM with proper message
+                    reflection_llm_endpoint = self.config.reflection.server_url
+                    endpoint_msg = (
+                        f" at {reflection_llm_endpoint}"
+                        if reflection_llm_endpoint
+                        else ""
+                    )
+                    raise APIError(
+                        f"Reflection LLM NIM unavailable{endpoint_msg}. Please verify the service is running and accessible or disable reflection.",
+                        ErrorCodeMapping.SERVICE_UNAVAILABLE,
+                    ) from e
+                except APIError:
+                    # Re-raise APIError as-is
+                    raise
                 if not is_grounded:
                     logger.warning(
                         "Could not generate sufficiently grounded response after %d total reflection attempts",
                         reflection_counter.current_count,
                     )
                 return RAGResponse(
-                    generate_answer(
-                        iter([final_response]),
+                    generate_answer_async(
+                        _async_iter([final_response]),
                         context_to_show,
                         model=model,
-                        collection_name=collection_name,
+                        collection_name=validated_collections[0] if validated_collections else "",
                         enable_citations=enable_citations,
                         context_reranker_time_ms=context_reranker_time_ms,
                         retrieval_time_ms=retrieval_time_ms,
@@ -1844,15 +2502,20 @@ class NvidiaRAG:
                     status_code=ErrorCodeMapping.SUCCESS,
                 )
             else:
+                # Create async stream generator
+                stream_gen = chain.astream(
+                    {"question": query, "context": docs},
+                    config={"run_name": "llm-stream"},
+                )
+                # Eagerly fetch first chunk to trigger any errors before returning response
+                prefetched_stream = await self._eager_prefetch_astream(stream_gen)
+
                 return RAGResponse(
-                    generate_answer(
-                        chain.stream(
-                            {"question": query, "context": docs},
-                            config={"run_name": "llm-stream"},
-                        ),
+                    generate_answer_async(
+                        prefetched_stream,
                         context_to_show,
                         model=model,
-                        collection_name=collection_name,
+                        collection_name=validated_collections[0] if validated_collections else "",
                         enable_citations=enable_citations,
                         context_reranker_time_ms=context_reranker_time_ms,
                         retrieval_time_ms=retrieval_time_ms,
@@ -1867,60 +2530,78 @@ class NvidiaRAG:
                 "Connection timed out while making a request to the LLM endpoint: %s", e
             )
             return RAGResponse(
-                generate_answer(
-                    iter(
+                generate_answer_async(
+                    _async_iter(
                         [
                             "Connection timed out while making a request to the NIM endpoint. Verify if the NIM server is available."
                         ]
                     ),
                     [],
                     model=model,
-                    collection_name=collection_name,
+                    collection_name=collection_names[0] if collection_names else "",
                     enable_citations=enable_citations,
                     otel_metrics_client=metrics,
                 ),
                 status_code=ErrorCodeMapping.REQUEST_TIMEOUT,
             )
 
-        except requests.exceptions.ConnectionError as e:
-            if "HTTPConnectionPool" in str(e):
-                logger.exception(
-                    "Connection pool error while connecting to service: %s", e
-                )
-                return RAGResponse(
-                    generate_answer(
-                        iter(
-                            [
-                                "Connection error: Failed to connect to service. Please verify if all required NIMs are running and accessible."
-                            ]
-                        ),
-                        [],
-                        model=model,
-                        collection_name=collection_name,
-                        enable_citations=enable_citations,
-                        otel_metrics_client=metrics,
-                    ),
-                    status_code=ErrorCodeMapping.SERVICE_UNAVAILABLE,
-                )
+        except APIError as e:
+            # APIError from any service (embedding, reranker, etc.) - convert to RAGResponse
+            logger.warning("APIError in _rag_chain: %s", e.message)
+            return RAGResponse(
+                generate_answer_async(
+                    _async_iter([e.message]),
+                    [],
+                    model=model,
+                    collection_name=collection_names[0] if collection_names else "",
+                    enable_citations=enable_citations,
+                    otel_metrics_client=metrics,
+                ),
+                status_code=e.status_code,
+            )
+
+        except (requests.exceptions.ConnectionError, ConnectionError, OSError):
+            # Fallback for uncaught LLM connection errors
+            llm_url = llm_settings.get("llm_endpoint") or self.config.llm.server_url
+            error_msg = f"LLM NIM unavailable at {llm_url}. Please verify the service is running and accessible."
+            logger.exception("Connection error (LLM)")
+            return RAGResponse(
+                generate_answer_async(
+                    _async_iter([error_msg]),
+                    [],
+                    model=model,
+                    collection_name=collection_names[0] if collection_names else "",
+                    enable_citations=enable_citations,
+                    otel_metrics_client=metrics,
+                ),
+                status_code=ErrorCodeMapping.SERVICE_UNAVAILABLE,
+            )
 
         except Exception as e:
-            logger.warning("Failed to generate response due to exception %s", e)
-            print_exc()
+            # Extract just the error type and message for cleaner logs
+            error_msg = str(e).split("\n")[0] if "\n" in str(e) else str(e)
+            logger.warning(
+                "Failed to generate response due to exception: %s", error_msg
+            )
+
+            # Only show full traceback at DEBUG level
+            if logger.getEffectiveLevel() <= logging.DEBUG:
+                print_exc()
 
             if "[403] Forbidden" in str(e) and "Invalid UAM response" in str(e):
                 logger.warning(
                     "Authentication or permission error: Verify the validity and permissions of your NVIDIA API key."
                 )
                 return RAGResponse(
-                    generate_answer(
-                        iter(
+                    generate_answer_async(
+                        _async_iter(
                             [
                                 "Authentication or permission error: Verify the validity and permissions of your NVIDIA API key."
                             ]
                         ),
                         [],
                         model=model,
-                        collection_name=collection_name,
+                        collection_name=collection_names[0] if collection_names else "",
                         enable_citations=enable_citations,
                         otel_metrics_client=metrics,
                     ),
@@ -1928,19 +2609,27 @@ class NvidiaRAG:
                 )
             elif "[404] Not Found" in str(e):
                 # Check if this is a VLM-related error
-                if enable_vlm_inference and vlm_model:
-                    error_msg = f"VLM model '{vlm_model}' not found. Please verify the VLM model name and ensure it's available in your NVIDIA API account."
+                requested_vlm_model = None
+                if isinstance(vlm_settings, dict):
+                    requested_vlm_model = vlm_settings.get("vlm_model")
+                effective_vlm_model = requested_vlm_model or self.config.vlm.model_name
+
+                if enable_vlm_inference and effective_vlm_model:
+                    error_msg = (
+                        f"VLM model '{effective_vlm_model}' not found. "
+                        "Please verify the VLM model name and ensure it's available in your NVIDIA API account."
+                    )
                     logger.warning(f"VLM model not found: {error_msg}")
                 else:
                     error_msg = "Model or endpoint not found. Please verify the API endpoint and your payload. Ensure that the model name is valid."
                     logger.warning(f"Model not found: {error_msg}")
 
                 return RAGResponse(
-                    generate_answer(
-                        iter([error_msg]),
+                    generate_answer_async(
+                        _async_iter([error_msg]),
                         [],
                         model=model,
-                        collection_name=collection_name,
+                        collection_name=collection_names[0] if collection_names else "",
                         enable_citations=enable_citations,
                         otel_metrics_client=metrics,
                     ),
@@ -1948,30 +2637,26 @@ class NvidiaRAG:
                 )
             else:
                 return RAGResponse(
-                    generate_answer(
-                        iter(
-                            [
-                                f"{str(e)}"
-                            ]
-                        ),
+                    generate_answer_async(
+                        _async_iter([str(e)]),
                         [],
                         model=model,
-                        collection_name=collection_name,
+                        collection_name=collection_names[0] if collection_names else "",
                         enable_citations=enable_citations,
                         otel_metrics_client=metrics,
                     ),
                     status_code=ErrorCodeMapping.BAD_REQUEST,
                 )
 
-    def __print_conversation_history(
+    def _print_conversation_history(
         self, conversation_history: list[str] = None, query: str | None = None
-    ):
+    ) -> None:
         if conversation_history is not None:
             for role, content in conversation_history:
                 logger.debug("Role: %s", role)
                 logger.debug("Content: %s\n", content)
 
-    def __normalize_relevance_scores(
+    def _normalize_relevance_scores(
         self, documents: list["Document"]
     ) -> list["Document"]:
         """
@@ -1996,7 +2681,7 @@ class NvidiaRAG:
 
         return documents
 
-    def __format_document_with_source(self, doc) -> str:
+    def _format_document_with_source(self, doc: "Document") -> str:
         """Format document content with its source filename.
 
         Args:

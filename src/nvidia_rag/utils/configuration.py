@@ -12,772 +12,1128 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The definition of the application configuration."""
+"""Simple configuration for NVIDIA RAG."""
 
+import json
 import os
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
 
-from .configuration_wizard import ConfigWizard, configclass, configfield
+import yaml
+from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
+from pydantic import Field as PydanticField
+from pydantic.fields import FieldInfo
 
 
-@configclass
-class VectorStoreConfig(ConfigWizard):
-    """Configuration class for the Vector Store connection.
+def Field(default=None, *, env: str = None, description: str = None, **kwargs):
+    """Pydantic Field with optional environment variable support.
 
-    :cvar name: Name of vector store
-    :cvar url: URL of Vector Store
+    Args:
+        default: Default value
+        env: Environment variable name (optional)
+        description: Description of what the field is for (optional)
+        **kwargs: Other Pydantic Field parameters
+
+    Example:
+        name: str = Field(default="milvus", env="APP_VECTORSTORE_NAME", description="Vector store name")
+    """
+    if env:
+        if "json_schema_extra" not in kwargs:
+            kwargs["json_schema_extra"] = {}
+        kwargs["json_schema_extra"]["env"] = env
+
+    if description:
+        kwargs["description"] = description
+
+    return PydanticField(default=default, **kwargs)
+
+
+class _ConfigBase(BaseModel):
+    """Base configuration class with automatic environment variable loading.
+
+    Usage:
+        class MyConfig(_ConfigBase):
+            server_url: str = Field(default="", env="MY_SERVER_URL")
+
+    Priority: dict/yaml values > env vars > defaults
     """
 
-    name: str = configfield(
-        "name",
-        default="milvus",
-        help_txt="The name of vector store",  # supports "milvus", "elasticsearch"
+    def __init__(self, **data):
+        # Load values from environment variables
+        env_values = {}
+        for field_name, field_info in self.model_fields.items():
+            # Check if Field has 'env' in json_schema_extra
+            if isinstance(field_info, FieldInfo) and field_info.json_schema_extra:
+                env_var_name = field_info.json_schema_extra.get("env")
+                if env_var_name and env_var_name in os.environ:
+                    raw_value = os.environ[env_var_name]
+                    # Strip surrounding quotes if present (handles Docker Compose quoted values)
+                    if isinstance(raw_value, str) and len(raw_value) >= 2:
+                        # More robust quote stripping: strip whitespace first, then quotes
+                        raw_value = raw_value.strip()
+                        if (raw_value.startswith('"') and raw_value.endswith('"')) or (
+                            raw_value.startswith("'") and raw_value.endswith("'")
+                        ):
+                            raw_value = raw_value[1:-1]
+                    env_values[field_name] = raw_value
+
+        # Merge: data overrides env vars, env vars override defaults
+        merged_data = {**env_values, **data}
+
+        super().__init__(**merged_data)
+
+    def get_api_key(self) -> str | None:
+        """Get API key with fallback to global NVIDIA_API_KEY or NGC_API_KEY.
+
+        Returns:
+            API key string if found, None otherwise.
+        """
+        if hasattr(self, "api_key") and self.api_key:
+            api_key_value = self.api_key.get_secret_value()
+            if api_key_value:
+                return api_key_value
+
+        return os.environ.get("NVIDIA_API_KEY") or os.environ.get("NGC_API_KEY")
+
+
+class SearchType(StrEnum):
+    """Allowed search types for vector store queries."""
+
+    DENSE = "dense"
+    HYBRID = "hybrid"
+
+
+class VectorStoreConfig(_ConfigBase):
+    """Vector Store configuration.
+
+    Environment variables:
+        APP_VECTORSTORE_NAME, APP_VECTORSTORE_URL, APP_VECTORSTORE_INDEXTYPE,
+        APP_VECTORSTORE_SEARCHTYPE, COLLECTION_NAME, etc.
+    """
+
+    name: str = Field(
+        default="lancedb",
+        env="APP_VECTORSTORE_NAME",
+        description="Name of the vector store backend (e.g., lancedb, milvus, elasticsearch)",
     )
-    url: str = configfield(
-        "url",
-        default="http://localhost:19530",
-        help_txt="The host of the machine running Vector Store DB",
+    url: str = Field(
+        default="/tmp/lancedb_data",
+        env="APP_VECTORSTORE_URL",
+        description="URL endpoint for the vector store service (path for LanceDB)",
     )
-    nlist: int = configfield(
-        "nlist",
+
+    @field_validator("name", "url", mode="before")
+    @classmethod
+    def normalize_string(cls, v: Any) -> Any:
+        """Normalize string fields by stripping whitespace and quotes."""
+        if isinstance(v, str):
+            return v.strip().strip('"').strip("'")
+        return v
+
+    nlist: int = Field(
         default=64,
-        help_txt="Number of cluster units",  # IVF Flat milvus
+        env="APP_VECTORSTORE_NLIST",
+        description="Number of clusters for IVF index",
     )
-    nprobe: int = configfield(
-        "nprobe",
+    nprobe: int = Field(
         default=16,
-        help_txt="Number of units to query",  # IVF Flat milvus
+        env="APP_VECTORSTORE_NPROBE",
+        description="Number of clusters to search during query",
     )
-    index_type: str = configfield(
-        "index_type",
+    index_type: str = Field(
         default="GPU_CAGRA",
-        help_txt="Index of the vector db",  # IVF Flat for milvus
+        env="APP_VECTORSTORE_INDEXTYPE",
+        description="Type of vector index (e.g., GPU_CAGRA, IVF_FLAT)",
     )
-
-    enable_gpu_index: bool = configfield(
-        "enable_gpu_index",
+    enable_gpu_index: bool = Field(
         default=True,
-        help_txt="Flag to control GPU indexing",
+        env="APP_VECTORSTORE_ENABLEGPUINDEX",
+        description="Enable GPU acceleration for index building",
     )
-
-    enable_gpu_search: bool = configfield(
-        "enable_gpu_search",
+    enable_gpu_search: bool = Field(
         default=True,
-        help_txt="Flag to control GPU search",
+        env="APP_VECTORSTORE_ENABLEGPUSEARCH",
+        description="Enable GPU acceleration for search operations",
     )
-
-    search_type: str = configfield(
-        "search_type",
-        default="dense",  # dense or hybrid
-        help_txt="Flag to control search type - 'dense' retrieval or 'hybrid' retrieval",
+    search_type: SearchType = Field(
+        default=SearchType.DENSE,
+        env="APP_VECTORSTORE_SEARCHTYPE",
+        description="Type of search to perform (dense, hybrid)",
     )
-
-    default_collection_name: str = configfield(
-        "default_collection_name",
+    default_collection_name: str = Field(
         default="multimodal_data",
-        env_name="COLLECTION_NAME",
-        help_txt="Default collection name for vector store",
+        env="COLLECTION_NAME",
+        description="Default collection/index name for storing vectors",
     )
-
-    ef: int = configfield(
-        "ef",
+    ef: int = Field(
         default=100,
-        help_txt="Parameter controlling query time/accuracy trade-off. Higher ef leads to more accurate but slower search.",
+        env="APP_VECTORSTORE_EF",
+        description="Size of the dynamic candidate list for HNSW search",
+    )
+    username: str = Field(
+        default="",
+        env="APP_VECTORSTORE_USERNAME",
+        description="Username for vector store authentication",
+    )
+    password: SecretStr | None = Field(
+        default=None,
+        env="APP_VECTORSTORE_PASSWORD",
+        description="Password for vector store authentication",
+    )
+
+    # API key authentication for vector store (used by Elasticsearch)
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="APP_VECTORSTORE_APIKEY",
+        description="API key for vector store authentication (base64 form 'id:secret')",
+    )
+    api_key_id: str = Field(
+        default="",
+        env="APP_VECTORSTORE_APIKEY_ID",
+        description="API key ID for vector store authentication",
+    )
+    api_key_secret: SecretStr | None = Field(
+        default=None,
+        env="APP_VECTORSTORE_APIKEY_SECRET",
+        description="API key secret for vector store authentication",
     )
 
 
-@configclass
-class NvIngestConfig(ConfigWizard):
-    """
-    Configuration for NV-Ingest.
-    """
+class NvIngestConfig(_ConfigBase):
+    """NV-Ingest configuration."""
 
-    # NV-Ingest Runtime Connectivity Configuration parameters
-    message_client_hostname: str = configfield(
-        "message_client_hostname",
-        default="localhost",  # TODO
-        help_txt="NV Ingest Message Client Host Name",
+    message_client_hostname: str = Field(
+        default="localhost",
+        env="APP_NVINGEST_MESSAGECLIENTHOSTNAME",
+        description="Hostname for NV-Ingest message client",
     )
-
-    message_client_port: int = configfield(
-        "message_client_port",
+    message_client_port: int = Field(
         default=7670,
-        help_txt="NV Ingest Message Client Port",
+        env="APP_NVINGEST_MESSAGECLIENTPORT",
+        description="Port for NV-Ingest message client",
     )
 
-    # Extraction Configuration Parameters (Add additional parameters here)
-    extract_text: bool = configfield(
-        "extract_text",
+    @field_validator("message_client_port")
+    @classmethod
+    def validate_port(cls, v: int) -> int:
+        if not (1 <= v <= 65535):
+            raise ValueError("Port must be between 1 and 65535")
+        return v
+
+    extract_text: bool = Field(
         default=True,
-        help_txt="Enable extract text for nv-ingest extraction",
+        env="APP_NVINGEST_EXTRACTTEXT",
+        description="Enable text extraction from documents",
     )
-
-    extract_infographics: bool = configfield(
-        "extract_infographics",
+    extract_infographics: bool = Field(
         default=False,
-        help_txt="Enable extract infographics for nv-ingest extraction",
+        env="APP_NVINGEST_EXTRACTINFOGRAPHICS",
+        description="Enable infographic extraction from documents",
     )
-
-    extract_tables: bool = configfield(
-        "extract_tables",
+    extract_tables: bool = Field(
         default=True,
-        help_txt="Enable extract tables for nv-ingest extraction",
+        env="APP_NVINGEST_EXTRACTTABLES",
+        description="Enable table extraction from documents",
     )
-
-    extract_charts: bool = configfield(
-        "extract_charts",
+    extract_charts: bool = Field(
         default=True,
-        help_txt="Enable extract charts for nv-ingest extraction",
+        env="APP_NVINGEST_EXTRACTCHARTS",
+        description="Enable chart extraction from documents",
     )
-
-    extract_images: bool = configfield(
-        "extract_images",
+    extract_images: bool = Field(
         default=False,
-        help_txt="Enable extract images for nv-ingest extraction",
+        env="APP_NVINGEST_EXTRACTIMAGES",
+        description="Enable image extraction from documents",
     )
-
-    extract_page_as_image: bool = configfield(
-        "extract_page_as_image",
+    extract_page_as_image: bool = Field(
         default=False,
-        help_txt="Enable extract page as image for nv-ingest extraction",
+        env="APP_NVINGEST_EXTRACTPAGEASIMAGE",
+        description="Extract entire pages as images",
     )
-
-    structured_elements_modality: str = configfield(
-        "structured_elements_modality",
+    structured_elements_modality: str = Field(
         default="",
-        help_txt="Modality of structured elements",
-        env_name="STRUCTURED_ELEMENTS_MODALITY",
+        env="STRUCTURED_ELEMENTS_MODALITY",
+        description="Modality for processing structured elements (tables, charts)",
     )
-
-    image_elements_modality: str = configfield(
-        "image_elements_modality",
+    image_elements_modality: str = Field(
         default="",
-        help_txt="Modality of image elements",
-        env_name="IMAGE_ELEMENTS_MODALITY",
+        env="IMAGE_ELEMENTS_MODALITY",
+        description="Modality for processing image elements",
+    )
+    pdf_extract_method: str | None = Field(
+        default=None,
+        env="APP_NVINGEST_PDFEXTRACTMETHOD",
+        description="Method to use for PDF extraction",
     )
 
-    pdf_extract_method: str = configfield(
-        "pdf_extract_method",
-        default="None",  # Literal['pdfium','nemoretriever_parse','None']
-        help_txt="Extract method 'pdfium', 'nemoretriever_parse', 'None'",
-    )
+    @field_validator("pdf_extract_method", mode="before")
+    @classmethod
+    def normalize_pdf_extract_method(cls, v: Any) -> Any:
+        """Normalize string 'None'/'none' to Python None."""
+        if isinstance(v, str) and v.lower() in ("none", "null", ""):
+            return None
+        return v
 
-    text_depth: str = configfield(
-        "text_depth",
-        default="page",  # Literal['page', 'document']
-        help_txt="Extract text by 'page' or 'document'",
+    text_depth: str = Field(
+        default="page",
+        env="APP_NVINGEST_TEXTDEPTH",
+        description="Granularity level for text extraction (page, document)",
     )
-
-    # Splitting Configuration Parameters (Add additional parameters here)
-    tokenizer: str = configfield(
-        "tokenizer",
+    tokenizer: str = Field(
         default="intfloat/e5-large-unsupervised",
-        # Literal["intfloat/e5-large-unsupervised" , "meta-llama/Llama-3.2-1B"]
-        help_txt="Tokenizer for text splitting.",
+        env="APP_NVINGEST_TOKENIZER",
+        description="Tokenizer model for text chunking",
     )
-
-    chunk_size: int = configfield(
-        "chunk_size",
+    chunk_size: int = Field(
         default=1024,
-        help_txt="Chunk size for text splitting.",
+        env="APP_NVINGEST_CHUNKSIZE",
+        description="Maximum size of text chunks in tokens",
     )
-
-    chunk_overlap: int = configfield(
-        "chunk_overlap",
+    chunk_overlap: int = Field(
         default=150,
-        help_txt="Chunk overlap for text splitting.",
+        env="APP_NVINGEST_CHUNKOVERLAP",
+        description="Number of overlapping tokens between chunks",
     )
-
-    # Captioning Configuration Parameters
-    caption_model_name: str = configfield(
-        "caption_model_name",
-        default="nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
-        help_txt="NV Ingest Captioning model name",
+    caption_model_name: str = Field(
+        default="nvidia/nemotron-nano-12b-v2-vl",
+        env="APP_NVINGEST_CAPTIONMODELNAME",
+        description="Model name for generating image captions",
     )
-
-    caption_endpoint_url: str = configfield(
-        "caption_endpoint_url",
+    caption_endpoint_url: str = Field(
         default="https://integrate.api.nvidia.com/v1/chat/completions",
-        help_txt="NV Ingest Captioning model Endpoint URL",
+        env="APP_NVINGEST_CAPTIONENDPOINTURL",
+        description="API endpoint for caption generation service",
     )
 
-    enable_pdf_splitter: bool = configfield(
-        "enable_pdf_splitter",
+    @field_validator("caption_endpoint_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+    @model_validator(mode="after")
+    def validate_chunk_settings(self) -> "NvIngestConfig":
+        if self.chunk_overlap > self.chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) must be less than chunk_size ({self.chunk_size})"
+            )
+        return self
+
+    enable_pdf_splitter: bool = Field(
         default=True,
-        help_txt="Enable post chunk split for NV Ingest",
+        env="APP_NVINGEST_ENABLEPDFSPLITTER",
+        description="Enable PDF page splitting during ingestion",
     )
-
-    segment_audio: bool = configfield(
-        "segment_audio",
+    segment_audio: bool = Field(
         default=False,
-        help_txt="Enable audio segmentation for NV Ingest",
+        env="APP_NVINGEST_SEGMENTAUDIO",
+        description="Enable audio segmentation during ingestion",
     )
-
-    save_to_disk: bool = configfield(
-        "save_to_disk",
+    save_to_disk: bool = Field(
         default=False,
-        help_txt="Enable saving results to disk for NV Ingest",
+        env="APP_NVINGEST_SAVETODISK",
+        description="Save extracted content to disk for debugging",
+    )
+    # Batch processing configuration
+    enable_batch_mode: bool = Field(
+        default=True,
+        env="ENABLE_NV_INGEST_BATCH_MODE",
+        description="Process files in batches for better throughput",
+    )
+    files_per_batch: int = Field(
+        default=16,
+        env="NV_INGEST_FILES_PER_BATCH",
+        description="Number of files to process in each batch",
+    )
+    enable_parallel_batch_mode: bool = Field(
+        default=True,
+        env="ENABLE_NV_INGEST_PARALLEL_BATCH_MODE",
+        description="Enable parallel processing of multiple batches",
+    )
+    concurrent_batches: int = Field(
+        default=4,
+        env="NV_INGEST_CONCURRENT_BATCHES",
+        description="Number of batches to process concurrently",
+    )
+    enable_pdf_split_processing: bool = Field(
+        default=False,
+        env="APP_NVINGEST_ENABLE_PDF_SPLIT_PROCESSING",
+        description="Enable PDF split processing during ingestion",
+    )
+    pages_per_chunk: int = Field(
+        default=16,
+        env="APP_NVINGEST_PAGES_PER_CHUNK",
+        description="Number of pages per chunk for PDF split processing",
     )
 
 
-@configclass
-class ModelParametersConfig(ConfigWizard):
-    """Configuration class for model parameters based on model name.
+class ModelParametersConfig(_ConfigBase):
+    """Model parameters configuration."""
 
-    This defines default parameters for different LLM models.
-    """
-
-    max_tokens: int = configfield(
-        "max_tokens",
-        env_name="LLM_MAX_TOKENS",
+    max_tokens: int = Field(
         default=32768,
-        help_txt="The maximum number of tokens to generate in any given call.",
+        env="LLM_MAX_TOKENS",
+        description="Maximum number of tokens to generate in response",
     )
-
-    temperature: float = configfield(
-        "temperature",
-        env_name="LLM_TEMPERATURE",
+    min_tokens: int = Field(
         default=0,
-        help_txt="The sampling temperature to use for text generation.",
+        env="LLM_MIN_TOKENS",
+        description="Minimum number of tokens to generate in response",
     )
-
-    top_p: float = configfield(
-        "top_p",
-        env_name="LLM_TOP_P",
+    max_thinking_tokens: int = Field(
+        default=8192,
+        env="LLM_MAX_THINKING_TOKENS",
+        description="Maximum thinking tokens to allocate for reasoning models",
+    )
+    min_thinking_tokens: int = Field(
+        default=1,
+        env="LLM_MIN_THINKING_TOKENS",
+        description="Minimum thinking tokens to allocate for reasoning models",
+    )
+    ignore_eos: bool = Field(
+        default=False,
+        env="LLM_IGNORE_EOS",
+        description="Ignore end-of-sequence token during generation",
+    )
+    temperature: float = Field(
+        default=0.0,
+        env="LLM_TEMPERATURE",
+        description="Sampling temperature for controlling randomness (0.0 = deterministic)",
+    )
+    top_p: float = Field(
         default=1.0,
-        help_txt="The top-p sampling mass used for text generation.",
+        env="LLM_TOP_P",
+        description="Nucleus sampling threshold for token selection",
     )
 
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError("Temperature must be non-negative")
+        return v
 
-@configclass
-class LLMConfig(ConfigWizard):
-    """Configuration class for the llm connection.
+    @field_validator("top_p")
+    @classmethod
+    def validate_top_p(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("top_p must be between 0.0 and 1.0")
+        return v
 
-    :cvar server_url: The location of the llm server hosting the model.
-    :cvar model_name: The name of the hosted model.
-    """
 
-    server_url: str = configfield(
-        "server_url",
+class LLMConfig(_ConfigBase):
+    """LLM configuration."""
+
+    server_url: str = Field(
         default="",
-        help_txt="The location of the Triton server hosting the llm model.",
+        env="APP_LLM_SERVERURL",
+        description="URL endpoint for the LLM inference service",
     )
-    model_name: str = configfield(
-        "model_name",
+    model_name: str = Field(
         default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
-        help_txt="The name of the hosted model.",
+        env="APP_LLM_MODELNAME",
+        description="Name of the language model to use for generation",
     )
-    model_engine: str = configfield(
-        "model_engine",
+    model_engine: str = Field(
         default="nvidia-ai-endpoints",
-        help_txt="The server type of the hosted model. Allowed values are nvidia-ai-endpoints",
+        env="APP_LLM_MODELENGINE",
+        description="Engine/provider for LLM inference (e.g., nvidia-ai-endpoints, openai)",
     )
-    # Add model parameters configuration
-    parameters: ModelParametersConfig = configfield(
-        "parameters",
-        help_txt="Model-specific parameters for generation.",
-        default=ModelParametersConfig(),
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="APP_LLM_APIKEY",
+        description="API key for LLM service (overrides global NVIDIA_API_KEY)",
     )
+    parameters: ModelParametersConfig = PydanticField(
+        default_factory=ModelParametersConfig, description="Model generation parameters"
+    )
+
+    @field_validator("server_url", "model_name", "model_engine", mode="before")
+    @classmethod
+    def normalize_string(cls, v: Any) -> Any:
+        """Normalize string fields by stripping whitespace and quotes."""
+        if isinstance(v, str):
+            return v.strip().strip('"').strip("'")
+        return v
+
+    @field_validator("server_url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        """Ensure URL has a scheme."""
+        if v and not v.startswith(("http://", "https://")):
+            return f"http://{v}"
+        return v
 
     def get_model_parameters(self) -> dict:
-        """Return appropriate parameters based on the model name.
-
-        Returns a dictionary with max_tokens, temperature, and top_p
-        adjusted according to the model name.
-        """
-        params = {
+        """Return model parameters as dict."""
+        return {
+            "min_tokens": self.parameters.min_tokens,
+            "ignore_eos": self.parameters.ignore_eos,
             "max_tokens": self.parameters.max_tokens,
+            "min_thinking_tokens": self.parameters.min_thinking_tokens,
+            "max_thinking_tokens": self.parameters.max_thinking_tokens,
             "temperature": self.parameters.temperature,
             "top_p": self.parameters.top_p,
         }
-        return params
 
 
-@configclass
-class QueryRewriterConfig(ConfigWizard):
-    """Configuration class for the Query Rewriter."""
+class QueryRewriterConfig(_ConfigBase):
+    """Query Rewriter configuration."""
 
-    model_name: str = configfield(
-        "model_name",
+    model_name: str = Field(
         default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
-        help_txt="The llm name of the query rewriter model",
+        env="APP_QUERYREWRITER_MODELNAME",
+        description="Model for rewriting user queries to improve retrieval",
     )
-    server_url: str = configfield(
-        "server_url",
+    server_url: str = Field(
         default="",
-        help_txt="The location of the query rewriter model.",
+        env="APP_QUERYREWRITER_SERVERURL",
+        description="URL endpoint for query rewriter service",
     )
-    enable_query_rewriter: bool = configfield(
-        "enable_query_rewriter",
-        env_name="ENABLE_QUERYREWRITER",
+    enable_query_rewriter: bool = Field(
         default=False,
-        help_txt="Enable query rewriter",
+        env="ENABLE_QUERYREWRITER",
+        description="Enable automatic query rewriting before retrieval",
     )
-    # TODO: Add temperature, top_p, max_tokens
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="APP_QUERYREWRITER_APIKEY",
+        description="API key for query rewriter (overrides global NVIDIA_API_KEY)",
+    )
+    multiturn_retrieval_simple: bool = Field(
+        default=False,
+        env="MULTITURN_RETRIEVER_SIMPLE",
+        description="Enable concatenating conversation history with current query for retrieval (used when query rewriter is disabled)",
+    )
+
+    @field_validator("server_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
 
 
-@configclass
-class FilterExpressionGeneratorConfig(ConfigWizard):
-    """Configuration class for the Filter Expression Generator."""
+class FilterExpressionGeneratorConfig(_ConfigBase):
+    """Filter Expression Generator configuration."""
 
-    model_name: str = configfield(
-        "model_name",
-        env_name="APP_FILTEREXPRESSIONGENERATOR_MODELNAME",
+    model_name: str = Field(
         default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
-        help_txt="The llm name of the filter expression generator model",
+        env="APP_FILTEREXPRESSIONGENERATOR_MODELNAME",
+        description="Model for generating metadata filter expressions from queries",
     )
-    server_url: str = configfield(
-        "server_url",
-        env_name="APP_FILTEREXPRESSIONGENERATOR_SERVERURL",
+    server_url: str = Field(
         default="",
-        help_txt="The location of the filter expression generator model.",
+        env="APP_FILTEREXPRESSIONGENERATOR_SERVERURL",
+        description="URL endpoint for filter expression generator service",
     )
-    enable_filter_generator: bool = configfield(
-        "enable_filter_generator",
-        env_name="ENABLE_FILTER_GENERATOR",
+    enable_filter_generator: bool = Field(
         default=False,
-        help_txt="Enable filter expression generator",
+        env="ENABLE_FILTER_GENERATOR",
+        description="Enable automatic filter expression generation from natural language",
     )
-    temperature: float = configfield(
-        "temperature",
-        default=0,
-        help_txt="The sampling temperature for filter expression generation.",
-    )
-    top_p: float = configfield(
-        "top_p",
-        default=1.0,
-        help_txt="The top-p sampling mass for filter expression generation.",
-    )
-    max_tokens: int = configfield(
-        "max_tokens",
-        default=32768,
-        help_txt="The maximum number of tokens for filter expression generation.",
-    )
-
-
-@configclass
-class TextSplitterConfig(ConfigWizard):
-    """Configuration class for the Text Splitter.
-
-    :cvar chunk_size: Chunk size for text splitter. Tokens per chunk in token-based splitters.
-    :cvar chunk_overlap: Text overlap in text splitter.
-    """
-
-    model_name: str = configfield(
-        "model_name",
-        default="Snowflake/snowflake-arctic-embed-l",
-        help_txt="The name of Sentence Transformer model used for SentenceTransformer TextSplitter.",
-    )
-    chunk_size: int = configfield(
-        "chunk_size",
-        default=510,
-        help_txt="Chunk size for text splitting.",
-    )
-    chunk_overlap: int = configfield(
-        "chunk_overlap",
-        default=200,
-        help_txt="Overlapping text length for splitting.",
-    )
-
-
-@configclass
-class EmbeddingConfig(ConfigWizard):
-    """Configuration class for the Embeddings.
-
-    :cvar model_name: The name of the huggingface embedding model.
-    """
-
-    model_name: str = configfield(
-        "model_name",
-        default="nvidia/llama-3.2-nv-embedqa-1b-v2",
-        help_txt="The name of huggingface embedding model.",
-    )
-    model_engine: str = configfield(
-        "model_engine",
-        default="nvidia-ai-endpoints",
-        help_txt="The server type of the hosted model. Allowed values are hugginface",
-    )
-    dimensions: int = configfield(
-        "dimensions",
-        default=2048,
-        help_txt="The required dimensions of the embedding model. Currently utilized for vector DB indexing.",
-    )
-    server_url: str = configfield(
-        "server_url",
-        default="",
-        help_txt="The url of the server hosting nemo embedding model",
-    )
-
-
-@configclass
-class RankingConfig(ConfigWizard):
-    """Configuration class for the Re-ranking.
-
-    :cvar model_name: The name of the Ranking model.
-    """
-
-    model_name: str = configfield(
-        "model_name",
-        default="nvidia/llama-3.2-nv-rerankqa-1b-v2",
-        help_txt="The name of Ranking model.",
-    )
-    model_engine: str = configfield(
-        "model_engine",
-        default="nvidia-ai-endpoints",
-        help_txt="The server type of the hosted model. Allowed values are nvidia-ai-endpoints",
-    )
-    server_url: str = configfield(
-        "server_url",
-        default="",
-        help_txt="The url of the server hosting nemo Ranking model",
-    )
-    enable_reranker: bool = configfield(
-        "enable_reranker",
-        env_name="ENABLE_RERANKER",
-        default=True,
-        help_txt="Enable reranking",
-    )
-
-
-@configclass
-class RetrieverConfig(ConfigWizard):
-    """Configuration class for the Retrieval pipeline.
-
-    :cvar top_k: Number of relevant results to retrieve.
-    :cvar score_threshold: The minimum confidence score for the retrieved values to be considered.
-    """
-
-    top_k: int = configfield(
-        "top_k",
-        default=10,
-        help_txt="Number of relevant results to retrieve",
-    )
-    vdb_top_k: int = configfield(
-        "vdb_top_k",
-        env_name="VECTOR_DB_TOPK",
-        default=100,
-        help_txt="Number of relevant results to retrieve from vector db",
-    )
-    score_threshold: float = configfield(
-        "score_threshold",
-        default=0.25,
-        help_txt="The minimum confidence score for the retrieved values to be considered",
-    )
-    nr_url: str = configfield(
-        "nr_url",
-        default="http://retrieval-ms:8000",
-        help_txt="The nemo retriever microservice url",
-    )
-    nr_pipeline: str = configfield(
-        "nr_pipeline",
-        default="ranked_hybrid",
-        help_txt="The name of the nemo retriever pipeline one of ranked_hybrid or hybrid",
-    )
-
-
-@configclass
-class TracingConfig(ConfigWizard):
-    """Configuration class for Open Telemetry Tracing."""
-
-    enabled: bool = configfield(
-        "enabled",
-        default=False,
-        help_txt="Enable Open Telemetry Tracing",
-    )
-    otlp_http_endpoint: str = configfield(
-        "otlp_http_endpoint",
-        env_name="APP_TRACING_OTLPHTTPENDPOINT",
-        default="",
-        help_txt="HTTP endpoint for OpenTelemetry trace export",
-    )
-    otlp_grpc_endpoint: str = configfield(
-        "otlp_grpc_endpoint",
-        env_name="APP_TRACING_OTLPGRPCENDPOINT",
-        default="",
-        help_txt="gRPC endpoint for OpenTelemetry trace export",
-    )
-    prometheus_multiproc_dir: str = configfield(
-        "prometheus_multiproc_dir",
-        env_name="PROMETHEUS_MULTIPROC_DIR",
-        default="/tmp/prom_data",
-        help_txt="Directory to store Prometheus multi-process metrics",
-    )
-
-
-@configclass
-class VLMConfig(ConfigWizard):
-    """Configuration class for the VLM."""
-
-    server_url: str = configfield(
-        "server_url",
-        default="http://localhost:8000/v1",
-        help_txt="The url of the server hosting the VLM model",
-    )
-    model_name: str = configfield(
-        "model_name",
-        default="nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
-        help_txt="The name of the VLM model",
-    )
-    enable_vlm_response_reasoning: bool = configfield(
-        "enable_vlm_response_reasoning",
-        env_name="ENABLE_VLM_RESPONSE_REASONING",
-        default=False,
-        help_txt="Enable reasoning gate on VLM responses before adding them to the prompt",
-    )
-    max_total_images: int = configfield(
-        "max_total_images",
-        env_name="APP_VLM_MAX_TOTAL_IMAGES",
-        default=4,
-        help_txt="Maximum total images sent to VLM per request (query + context).",
-    )
-    max_query_images: int = configfield(
-        "max_query_images",
-        env_name="APP_VLM_MAX_QUERY_IMAGES",
-        default=1,
-        help_txt="Maximum number of query images included in the VLM request.",
-    )
-    max_context_images: int = configfield(
-        "max_context_images",
-        env_name="APP_VLM_MAX_CONTEXT_IMAGES",
-        default=1,
-        help_txt="Maximum number of context images included in the VLM request.",
-    )
-    vlm_response_as_final_answer: bool = configfield(
-        "vlm_response_as_final_answer",
-        env_name="APP_VLM_RESPONSE_AS_FINAL_ANSWER",
-        default=False,
-        help_txt="If enabled, use the VLM's response as the final answer instead of further LLM reasoning.",
-    )
-
-
-@configclass
-class MinioConfig(ConfigWizard):
-    """Configuration class for the Minio."""
-
-    endpoint: str = configfield(
-        "endpoint",
-        env_name="MINIO_ENDPOINT",
-        default="localhost:9010",
-        help_txt="The endpoint of the minio server",
-    )
-    # TODO: Hide secret keys so it's not visible when showing config
-    access_key: str = configfield(
-        "access_key",
-        env_name="MINIO_ACCESSKEY",
-        default="minioadmin",
-        help_txt="The access key of the minio server",
-    )
-    secret_key: str = configfield(
-        "secret_key",
-        env_name="MINIO_SECRETKEY",
-        default="minioadmin",
-        help_txt="The secret key of the minio server",
-    )
-
-
-@configclass
-class SummarizerConfig(ConfigWizard):
-    """Configuration class for the Summarizer."""
-
-    model_name: str = configfield(
-        "model_name",
-        env_name="SUMMARY_LLM",
-        default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
-        help_txt="The name of the summarizer model",
-    )
-    server_url: str = configfield(
-        "server_url",
-        env_name="SUMMARY_LLM_SERVERURL",
-        default="",
-        help_txt="The url of the server hosting the summarizer model",
-    )
-    max_chunk_length: int = configfield(
-        "max_chunk_length",
-        env_name="SUMMARY_LLM_MAX_CHUNK_LENGTH",
-        default=50000,
-        help_txt="Maximum chunk size in characters for the summarizer model",
-    )
-    chunk_overlap: int = configfield(
-        "chunk_overlap",
-        env_name="SUMMARY_CHUNK_OVERLAP",
-        default=200,
-        help_txt="Overlap between chunks for iterative summarization (in characters)",
-    )
-
-
-@configclass
-class MetadataConfig(ConfigWizard):
-    """Configuration for metadata handling and validation.
-    - All type/format constants are referenced from metadata_validation.py
-    """
-
-    max_array_length: int = configfield(
-        "max_array_length",
-        default=1000,
-        help_txt="Maximum length for array metadata fields",
-    )
-    max_string_length: int = configfield(
-        "max_string_length",
-        default=65535,
-        help_txt="Maximum length for string metadata fields",
-    )
-    allow_partial_filtering: bool = configfield(
-        "allow_partial_filtering",
-        default=False,
-        help_txt="Allow partial filtering across collections. When True, only collections that fully support the filter are used. When False, all collections must support the filter or the request fails.",
-    )
-
-
-@configclass
-class QueryDecompositionConfig(ConfigWizard):
-    """Configuration class for the Query Decomposition."""
-
-    enable_query_decomposition: bool = configfield(
-        "enable_query_decomposition",
-        env_name="ENABLE_QUERY_DECOMPOSITION",
-        default=False,
-        help_txt="Enable query decomposition",
-    )
-    recursion_depth: int = configfield(
-        "recursion_depth",
-        env_name="MAX_RECURSION_DEPTH",
-        default=3,
-        help_txt="Maximum recursion depth for query decomposition",
-    )
-
-
-@configclass
-class AppConfig(ConfigWizard):
-    """Configuration class for the application.
-
-    :cvar vector_store: The configuration of the vector db connection.
-    :type vector_store: VectorStoreConfig
-    :cvar llm: The configuration of the backend llm server.
-    :type llm: LLMConfig
-    :cvar text_splitter: The configuration for text splitter
-    :type text_splitter: TextSplitterConfig
-    :cvar embeddings: The configuration for huggingface embeddings
-    :type embeddings: EmbeddingConfig
-    :cvar prompts: The Prompts template for RAG and Chat
-    :type prompts: PromptsConfig
-    :cvar metadata: The configuration for metadata handling.
-    :type metadata: MetadataConfig
-    """
-
-    vector_store: VectorStoreConfig = configfield(
-        "vector_store",
-        env=False,
-        help_txt="The configuration of the vector db connection.",
-        default=VectorStoreConfig(),
-    )
-    llm: LLMConfig = configfield(
-        "llm",
-        env=False,
-        help_txt="The configuration for the server hosting the Large Language Models.",
-        default=LLMConfig(),
-    )
-    query_rewriter: QueryRewriterConfig = configfield(
-        "query_rewriter",
-        env=False,
-        help_txt="The configuration for the query rewriter.",
-        default=QueryRewriterConfig(),
-    )
-    filter_expression_generator: FilterExpressionGeneratorConfig = configfield(
-        "filter_expression_generator",
-        env=False,
-        help_txt="The configuration for the filter expression generator.",
-        default=FilterExpressionGeneratorConfig(),
-    )
-    text_splitter: TextSplitterConfig = configfield(
-        "text_splitter",
-        env=False,
-        help_txt="The configuration for text splitter.",
-        default=TextSplitterConfig(),
-    )
-    embeddings: EmbeddingConfig = configfield(
-        "embeddings",
-        env=False,
-        help_txt="The configuration of embedding model.",
-        default=EmbeddingConfig(),
-    )
-    ranking: RankingConfig = configfield(
-        "ranking",
-        env=False,
-        help_txt="The configuration of ranking model.",
-        default=RankingConfig(),
-    )
-    retriever: RetrieverConfig = configfield(
-        "retriever",
-        env=False,
-        help_txt="The configuration of the retriever pipeline.",
-        default=RetrieverConfig(),
-    )
-    nv_ingest: NvIngestConfig = configfield(
-        "nv_ingest",
-        env=False,
-        help_txt="The configuration for nv-ingest.",
-        default=NvIngestConfig(),
-    )
-    tracing: TracingConfig = configfield(
-        "tracing", env=False, help_txt="", default=TracingConfig()
-    )
-    enable_guardrails: bool = configfield(
-        "enable_guardrails",
-        env_name="ENABLE_GUARDRAILS",
-        default=False,
-        help_txt="Enable guardrails",
-    )
-    enable_citations: bool = configfield(
-        "enable_citations",
-        env_name="ENABLE_CITATIONS",
-        default=True,
-        help_txt="Enable citations",
-    )
-    enable_vlm_inference: bool = configfield(
-        "enable_vlm_inference",
-        env_name="ENABLE_VLM_INFERENCE",
-        default=False,
-        help_txt="Enable VLM inference",
-    )
-    default_confidence_threshold: float = configfield(
-        "default_confidence_threshold",
-        env_name="RERANKER_CONFIDENCE_THRESHOLD",
+    temperature: float = Field(
         default=0.0,
-        help_txt="Default confidence threshold for filtering documents by reranker relevance scores (0.0 to 1.0). Only documents with scores >= this threshold are included.",
+        env="APP_FILTEREXPRESSIONGENERATOR_TEMPERATURE",
+        description="Sampling temperature for filter generation",
     )
-    vlm: VLMConfig = configfield(
-        "vlm",
-        env=False,
-        help_txt="The configuration for the VLM.",
-        default=VLMConfig(),
+    top_p: float = Field(
+        default=1.0,
+        env="APP_FILTEREXPRESSIONGENERATOR_TOPP",
+        description="Nucleus sampling threshold for filter generation",
     )
-    minio: MinioConfig = configfield(
-        "minio",
-        env=False,
-        help_txt="The configuration of the minio server.",
-        default=MinioConfig(),
+    max_tokens: int = Field(
+        default=32768,
+        env="APP_FILTEREXPRESSIONGENERATOR_MAXTOKENS",
+        description="Maximum tokens for filter expression generation",
     )
-    temp_dir: str = configfield(
-        "temp_dir",
-        env_name="TEMP_DIR",
-        default="./tmp-data",
-        help_txt="The temporary directory for the application.",
-    )
-    summarizer: SummarizerConfig = configfield(
-        "summarizer",
-        env=False,
-        help_txt="The configuration for the summarizer.",
-        default=SummarizerConfig(),
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="APP_FILTEREXPRESSIONGENERATOR_APIKEY",
+        description="API key for filter generator (overrides global NVIDIA_API_KEY)",
     )
 
-    metadata: MetadataConfig = configfield(
-        "metadata",
-        env=False,
-        help_txt="The configuration for metadata handling.",
-        default=MetadataConfig(),
+    @field_validator("server_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+
+class TextSplitterConfig(_ConfigBase):
+    """Text Splitter configuration."""
+
+    model_name: str = Field(
+        default="Snowflake/snowflake-arctic-embed-l",
+        env="APP_TEXTSPLITTER_MODELNAME",
+        description="Tokenizer model for text splitting",
     )
-    query_decomposition: QueryDecompositionConfig = configfield(
-        "query_decomposition",
-        env=False,
-        help_txt="The configuration for query decomposition.",
-        default=QueryDecompositionConfig(),
+    chunk_size: int = Field(
+        default=510,
+        env="APP_TEXTSPLITTER_CHUNKSIZE",
+        description="Target size for text chunks in tokens",
     )
+    chunk_overlap: int = Field(
+        default=200,
+        env="APP_TEXTSPLITTER_CHUNKOVERLAP",
+        description="Number of overlapping tokens between consecutive chunks",
+    )
+
+    @model_validator(mode="after")
+    def validate_chunk_settings(self) -> "TextSplitterConfig":
+        if self.chunk_overlap > self.chunk_size:
+            raise ValueError(
+                f"chunk_overlap ({self.chunk_overlap}) must be less than chunk_size ({self.chunk_size})"
+            )
+        return self
+
+
+class EmbeddingConfig(_ConfigBase):
+    """Embedding configuration."""
+
+    model_name: str = Field(
+        default="nvidia/llama-3.2-nv-embedqa-1b-v2",
+        env="APP_EMBEDDINGS_MODELNAME",
+        description="Model for generating text embeddings",
+    )
+    model_engine: str = Field(
+        default="nvidia-ai-endpoints",
+        env="APP_EMBEDDINGS_MODELENGINE",
+        description="Engine/provider for embedding generation",
+    )
+    dimensions: int = Field(
+        default=2048,
+        env="APP_EMBEDDINGS_DIMENSIONS",
+        description="Dimensionality of the embedding vectors",
+    )
+    server_url: str = Field(
+        default="",
+        env="APP_EMBEDDINGS_SERVERURL",
+        description="URL endpoint for embedding service",
+    )
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="APP_EMBEDDINGS_APIKEY",
+        description="API key for embedding service (overrides global NVIDIA_API_KEY)",
+    )
+
+    @field_validator("server_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+
+class RankingConfig(_ConfigBase):
+    """Ranking configuration."""
+
+    model_name: str = Field(
+        default="nvidia/llama-3.2-nv-rerankqa-1b-v2",
+        env="APP_RANKING_MODELNAME",
+        description="Model for reranking retrieved documents",
+    )
+    model_engine: str = Field(
+        default="nvidia-ai-endpoints",
+        env="APP_RANKING_MODELENGINE",
+        description="Engine/provider for reranking service",
+    )
+    server_url: str = Field(
+        default="",
+        env="APP_RANKING_SERVERURL",
+        description="URL endpoint for reranking service",
+    )
+    enable_reranker: bool = Field(
+        default=True,
+        env="ENABLE_RERANKER",
+        description="Enable reranking of retrieved documents before generation",
+    )
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="APP_RANKING_APIKEY",
+        description="API key for ranking service (overrides global NVIDIA_API_KEY)",
+    )
+
+    @field_validator("server_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+
+class RetrieverConfig(_ConfigBase):
+    """Retriever configuration."""
+
+    top_k: int = Field(
+        default=10,
+        env="APP_RETRIEVER_TOPK",
+        description="Number of top documents to return after retrieval and reranking",
+    )
+    vdb_top_k: int = Field(
+        default=100,
+        env="VECTOR_DB_TOPK",
+        description="Number of documents to retrieve from vector database before reranking",
+    )
+    score_threshold: float = Field(
+        default=0.25,
+        env="APP_RETRIEVER_SCORETHRESHOLD",
+        description="Minimum similarity score threshold for retrieved documents",
+    )
+    nr_url: str = Field(
+        default="http://retrieval-ms:8000",
+        env="APP_RETRIEVER_NRURL",
+        description="URL for NVIDIA Retrieval microservice",
+    )
+    nr_pipeline: str = Field(
+        default="ranked_hybrid",
+        env="APP_RETRIEVER_NRPIPELINE",
+        description="Retrieval pipeline to use (e.g., ranked_hybrid, dense, sparse)",
+    )
+
+    @field_validator("nr_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+    @field_validator("vdb_top_k")
+    @classmethod
+    def validate_vdb_top_k(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(
+                f"vdb_top_k must be greater than 0, got {v}. "
+                "Please provide a positive integer for the number of documents to retrieve from the vector database."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def validate_reranker_top_k(self) -> "RetrieverConfig":
+        if self.vdb_top_k is not None and self.top_k > self.vdb_top_k:
+            raise ValueError(
+                f"reranker_top_k ({self.top_k}) must be less than or equal to vdb_top_k ({self.vdb_top_k}). "
+                "Please check your settings and try again."
+            )
+        return self
+
+
+class TracingConfig(_ConfigBase):
+    """Tracing configuration."""
+
+    enabled: bool = Field(
+        default=False,
+        env="APP_TRACING_ENABLED",
+        description="Enable distributed tracing and metrics collection",
+    )
+    otlp_http_endpoint: str = Field(
+        default="",
+        env="APP_TRACING_OTLPHTTPENDPOINT",
+        description="OpenTelemetry HTTP endpoint for traces",
+    )
+    otlp_grpc_endpoint: str = Field(
+        default="",
+        env="APP_TRACING_OTLPGRPCENDPOINT",
+        description="OpenTelemetry gRPC endpoint for traces",
+    )
+    prometheus_multiproc_dir: str = Field(
+        default="/tmp/prom_data",
+        env="PROMETHEUS_MULTIPROC_DIR",
+        description="Directory for Prometheus multiprocess metrics",
+    )
+
+    @field_validator("otlp_http_endpoint", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+
+class VLMConfig(_ConfigBase):
+    """VLM configuration."""
+
+    server_url: str = Field(
+        default="http://localhost:8000/v1",
+        env="APP_VLM_SERVERURL",
+        description="URL endpoint for Vision-Language Model service",
+    )
+    model_name: str = Field(
+        default="nvidia/nemotron-nano-12b-v2-vl",
+        env="APP_VLM_MODELNAME",
+        description="Vision-Language Model for processing images and text",
+    )
+    temperature: float = Field(
+        default=0.7,
+        env="APP_VLM_TEMPERATURE",
+        description="Sampling temperature for VLM generation",
+    )
+    top_p: float = Field(
+        default=1.0,
+        env="APP_VLM_TOP_P",
+        description="Top-p sampling mass for VLM generation",
+    )
+    max_tokens: int = Field(
+        default=4096,
+        env="APP_VLM_MAX_TOKENS",
+        description="Maximum number of tokens to generate in any given VLM call",
+    )
+    max_total_images: int = Field(
+        default=5,
+        env="APP_VLM_MAX_TOTAL_IMAGES",
+        description="Maximum total images sent to VLM per request (query + context)",
+    )
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="APP_VLM_APIKEY",
+        description="API key for VLM service (overrides global NVIDIA_API_KEY)",
+    )
+
+    @field_validator("server_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+
+class MinioConfig(_ConfigBase):
+    """Minio configuration."""
+
+    endpoint: str = Field(
+        default="localhost:9010",
+        env="MINIO_ENDPOINT",
+        description="MinIO object storage endpoint",
+    )
+    access_key: SecretStr = Field(
+        default=SecretStr("minioadmin"),
+        env="MINIO_ACCESSKEY",
+        description="MinIO access key for authentication",
+    )
+    secret_key: SecretStr = Field(
+        default=SecretStr("minioadmin"),
+        env="MINIO_SECRETKEY",
+        description="MinIO secret key for authentication",
+    )
+
+
+class SummarizerConfig(_ConfigBase):
+    """Summarizer configuration."""
+
+    model_name: str = Field(
+        default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        env="SUMMARY_LLM",
+        description="Model for generating document summaries",
+    )
+    server_url: str = Field(
+        default="",
+        env="SUMMARY_LLM_SERVERURL",
+        description="URL endpoint for summarization service",
+    )
+    max_chunk_length: int = Field(
+        default=9000,
+        env="SUMMARY_LLM_MAX_CHUNK_LENGTH",
+        description="Maximum chunk size in tokens for the summarizer model",
+    )
+    chunk_overlap: int = Field(
+        default=400,
+        env="SUMMARY_CHUNK_OVERLAP",
+        description="Overlap between chunks for iterative summarization (in tokens)",
+    )
+    temperature: float = Field(
+        default=0.0,
+        env="SUMMARY_LLM_TEMPERATURE",
+        description="Sampling temperature for summary generation",
+    )
+    top_p: float = Field(
+        default=1.0,
+        env="SUMMARY_LLM_TOP_P",
+        description="Nucleus sampling threshold for summary generation",
+    )
+    max_parallelization: int = Field(
+        default=20,
+        env="SUMMARY_MAX_PARALLELIZATION",
+        description="Maximum concurrent summaries across entire system (coordinated via Redis)",
+    )
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="SUMMARY_LLM_APIKEY",
+        description="API key for summarization service (overrides global NVIDIA_API_KEY)",
+    )
+
+    @field_validator("server_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+
+class MetadataConfig(_ConfigBase):
+    """Metadata configuration."""
+
+    max_array_length: int = Field(
+        default=1000,
+        env="APP_METADATA_MAXARRAYLENGTH",
+        description="Maximum length for array-type metadata fields",
+    )
+    max_string_length: int = Field(
+        default=65535,
+        env="APP_METADATA_MAXSTRINGLENGTH",
+        description="Maximum length for string-type metadata fields",
+    )
+    allow_partial_filtering: bool = Field(
+        default=False,
+        env="APP_METADATA_ALLOWPARTIALFILTERING",
+        description="Allow partial matches in metadata filtering",
+    )
+
+
+class QueryDecompositionConfig(_ConfigBase):
+    """Query Decomposition configuration."""
+
+    enable_query_decomposition: bool = Field(
+        default=False,
+        env="ENABLE_QUERY_DECOMPOSITION",
+        description="Enable breaking down complex queries into sub-queries",
+    )
+    recursion_depth: int = Field(
+        default=3,
+        env="MAX_RECURSION_DEPTH",
+        description="Maximum depth for recursive query decomposition",
+    )
+
+
+class ReflectionConfig(_ConfigBase):
+    """Reflection configuration for context relevance and response groundedness."""
+
+    enable_reflection: bool = Field(
+        default=False,
+        env="ENABLE_REFLECTION",
+        description="Enable self-reflection to improve answer quality",
+    )
+    max_loops: int = Field(
+        default=3,
+        env="MAX_REFLECTION_LOOP",
+        description="Maximum number of reflection iterations",
+    )
+    model_name: str = Field(
+        default="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        env="REFLECTION_LLM",
+        description="Model for reflection and quality assessment",
+    )
+    server_url: str = Field(
+        default="",
+        env="REFLECTION_LLM_SERVERURL",
+        description="URL endpoint for reflection service",
+    )
+    context_relevance_threshold: int = Field(
+        default=1,
+        env="CONTEXT_RELEVANCE_THRESHOLD",
+        description="Minimum relevance score for context to be considered useful",
+    )
+    response_groundedness_threshold: int = Field(
+        default=1,
+        env="RESPONSE_GROUNDEDNESS_THRESHOLD",
+        description="Minimum groundedness score for response to be considered factual",
+    )
+    api_key: SecretStr | None = Field(
+        default=None,
+        env="REFLECTION_LLM_APIKEY",
+        description="API key for reflection service (overrides global NVIDIA_API_KEY)",
+    )
+
+    @field_validator("server_url", mode="before")
+    @classmethod
+    def normalize_url(cls, v: Any) -> Any:
+        """Normalize URL fields by stripping whitespace/quotes and adding scheme."""
+        if isinstance(v, str):
+            v = v.strip().strip('"').strip("'")
+            if v and not v.startswith(("http://", "https://")):
+                return f"http://{v}"
+        return v
+
+
+class NvidiaRAGConfig(_ConfigBase):
+    """Main NVIDIA RAG configuration.
+
+    Priority order (highest to lowest):
+    1. Config file values (YAML/JSON)
+    2. Environment variables
+    3. Default values
+    """
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    vector_store: VectorStoreConfig = PydanticField(default_factory=VectorStoreConfig)
+    llm: LLMConfig = PydanticField(default_factory=LLMConfig)
+    query_rewriter: QueryRewriterConfig = PydanticField(
+        default_factory=QueryRewriterConfig
+    )
+    filter_expression_generator: FilterExpressionGeneratorConfig = PydanticField(
+        default_factory=FilterExpressionGeneratorConfig
+    )
+    text_splitter: TextSplitterConfig = PydanticField(
+        default_factory=TextSplitterConfig
+    )
+    embeddings: EmbeddingConfig = PydanticField(default_factory=EmbeddingConfig)
+    ranking: RankingConfig = PydanticField(default_factory=RankingConfig)
+    retriever: RetrieverConfig = PydanticField(default_factory=RetrieverConfig)
+    nv_ingest: NvIngestConfig = PydanticField(default_factory=NvIngestConfig)
+    tracing: TracingConfig = PydanticField(default_factory=TracingConfig)
+    vlm: VLMConfig = PydanticField(default_factory=VLMConfig)
+    minio: MinioConfig = PydanticField(default_factory=MinioConfig)
+    summarizer: SummarizerConfig = PydanticField(default_factory=SummarizerConfig)
+    metadata: MetadataConfig = PydanticField(default_factory=MetadataConfig)
+    query_decomposition: QueryDecompositionConfig = PydanticField(
+        default_factory=QueryDecompositionConfig
+    )
+    reflection: ReflectionConfig = PydanticField(default_factory=ReflectionConfig)
+
+    # Top-level flags
+    enable_guardrails: bool = Field(
+        default=False,
+        env="ENABLE_GUARDRAILS",
+        description="Enable safety guardrails for input/output filtering",
+    )
+    enable_citations: bool = Field(
+        default=True,
+        env="ENABLE_CITATIONS",
+        description="Include source citations in generated responses",
+    )
+    enable_vlm_inference: bool = Field(
+        default=False,
+        env="ENABLE_VLM_INFERENCE",
+        description="Enable Vision-Language Model for multimodal queries",
+    )
+    vlm_to_llm_fallback: bool = Field(
+        default=True,
+        env="VLM_TO_LLM_FALLBACK",
+        description=(
+            "When true, if ENABLE_VLM_INFERENCE is on but no images are present in query, "
+            "messages, or context, the pipeline will fall back to the standard LLM RAG flow. "
+            "When false, VLM will be invoked even for text-only queries."
+        ),
+    )
+    default_confidence_threshold: float = Field(
+        default=0.0,
+        env="RERANKER_CONFIDENCE_THRESHOLD",
+        description="Default confidence threshold for reranker scores",
+    )
+    temp_dir: str = Field(
+        default="./tmp-data",
+        env="TEMP_DIR",
+        description="Temporary directory for file processing and storage",
+    )
+
+    @field_validator("default_confidence_threshold")
+    @classmethod
+    def validate_confidence_threshold(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(
+                f"confidence_threshold must be between 0.0 and 1.0, got {v}. "
+                "The confidence threshold represents the minimum relevance score required for documents to be included."
+            )
+        return v
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NvidiaRAGConfig":
+        """Create config from dictionary.
+
+        Priority: dict values > env vars > defaults
+
+        Args:
+            data: Configuration dictionary
+
+        Returns:
+            NvidiaRAGConfig instance
+        """
+        # Direct instantiation - constructor args have priority over env vars in pydantic-settings
+        return cls(**data)
+
+    @classmethod
+    def from_yaml(cls, filepath: str) -> "NvidiaRAGConfig":
+        """Create config from YAML file.
+
+        Priority: YAML values > env vars > defaults
+
+        Args:
+            filepath: Path to YAML file
+
+        Returns:
+            NvidiaRAGConfig instance
+        """
+        path = Path(filepath)
+        if not path.exists():
+            return cls()
+
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+
+        return cls.from_dict(data)
+
+    @classmethod
+    def from_json(cls, filepath: str) -> "NvidiaRAGConfig":
+        """Create config from JSON file.
+
+        Priority: JSON values > env vars > defaults
+
+        Args:
+            filepath: Path to JSON file
+
+        Returns:
+            NvidiaRAGConfig instance
+        """
+        path = Path(filepath)
+        if not path.exists():
+            return cls()
+
+        with open(path) as f:
+            data = json.load(f)
+
+        return cls.from_dict(data)
+
+    def __str__(self) -> str:
+        """Return formatted config as YAML-like string for easy reading.
+
+        Uses mode='json' to properly mask SecretStr fields (api_key, password, etc.)
+        as '**********' instead of exposing actual values.
+        """
+        return yaml.dump(
+            self.model_dump(mode="json"),
+            default_flow_style=False,
+            sort_keys=False,
+            indent=2,
+            width=120,
+            allow_unicode=True,
+        )
