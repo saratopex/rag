@@ -40,6 +40,8 @@ dependencies = [
     "langchain-elasticsearch>=0.3,<1.0",
     "lark>=1.2.2",
     "python-dateutil>=2.9.0.post0",
+    "lancedb>=0.20.0",
+    "pyarrow>=15.0.0",
 ]
 
 [project.optional-dependencies]

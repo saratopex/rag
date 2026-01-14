@@ -1013,9 +1013,9 @@ class NvidiaRAG:
                         )
 
             if enable_filter_generator and not is_image_query:
-                if self.config.vector_store.name != "milvus":
+                if self.config.vector_store.name not in ("milvus", "lancedb"):
                     logger.warning(
-                        f"Filter expression generator is currently only supported for Milvus. "
+                        f"Filter expression generator is currently only supported for Milvus and LanceDB. "
                         f"Current vector store: {self.config.vector_store.name}. Skipping filter generation."
                     )
                 else:
@@ -1965,9 +1965,9 @@ class NvidiaRAG:
                         )
 
             if enable_filter_generator and not is_image_query:
-                if self.config.vector_store.name != "milvus":
+                if self.config.vector_store.name not in ("milvus", "lancedb"):
                     logger.warning(
-                        f"Filter expression generator is currently only supported for Milvus. "
+                        f"Filter expression generator is currently only supported for Milvus and LanceDB. "
                         f"Current vector store: {self.config.vector_store.name}. Skipping filter generation."
                     )
                 else:

@@ -1831,12 +1831,12 @@ async def _vector_store_search_impl(
             logger.info(f"Original OpenAI filter: {original_filter}")
 
             # Convert OpenAI filter format to the appropriate format based on vector store
-            if CONFIG.vector_store.name == "milvus":
-                # Convert to Milvus string format
+            if CONFIG.vector_store.name in ("milvus", "lancedb"):
+                # Convert to Milvus/LanceDB string format
                 filter_expr = _convert_openai_filter_to_milvus_string(
                     search_request.filters
                 )
-                logger.info(f"✓ Converted filter to Milvus format: {filter_expr}")
+                logger.info(f"✓ Converted filter to {CONFIG.vector_store.name} format: {filter_expr}")
             elif CONFIG.vector_store.name == "elasticsearch":
                 # Convert to Elasticsearch query DSL format
                 filter_expr = _convert_openai_filter_to_elasticsearch(

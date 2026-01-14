@@ -113,14 +113,14 @@ class VectorStoreConfig(_ConfigBase):
     """
 
     name: str = Field(
-        default="milvus",
+        default="lancedb",
         env="APP_VECTORSTORE_NAME",
-        description="Name of the vector store backend (e.g., milvus, elasticsearch)",
+        description="Name of the vector store backend (e.g., lancedb, milvus, elasticsearch)",
     )
     url: str = Field(
-        default="http://localhost:19530",
+        default="/tmp/lancedb_data",
         env="APP_VECTORSTORE_URL",
-        description="URL endpoint for the vector store service",
+        description="URL endpoint for the vector store service (path for LanceDB)",
     )
 
     @field_validator("name", "url", mode="before")

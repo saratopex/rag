@@ -295,6 +295,109 @@ class TestVDBInit:
             assert call_args["es_url"] == "http://config-elasticsearch:9200"
 
     @patch("nvidia_rag.utils.vdb.get_metadata_configuration")
+    def test_get_vdb_op_lancedb_without_custom_metadata(self, mock_get_metadata_config):
+        """Test _get_vdb_op with LanceDB without custom metadata"""
+        mock_config = Mock()
+        mock_config.vector_store.name = "lancedb"
+        mock_config.vector_store.url = "/path/to/lancedb"
+        mock_config.vector_store.search_type = "dense"
+        mock_config.embeddings.dimensions = 768
+
+        mock_get_metadata_config.return_value = (None, None, None)
+
+        with patch(
+            "nvidia_rag.utils.vdb.lancedb.lancedb_vdb.LanceDBVDB"
+        ) as mock_lancedb_vdb:
+            mock_vdb_instance = Mock()
+            mock_lancedb_vdb.return_value = mock_vdb_instance
+
+            result = _get_vdb_op(
+                vdb_endpoint="/test/lancedb",
+                collection_name="test_collection",
+                embedding_model="test-embedding",
+                config=mock_config,
+            )
+
+            assert result == mock_vdb_instance
+            mock_lancedb_vdb.assert_called_once()
+            call_args = mock_lancedb_vdb.call_args[1]
+            assert call_args["db_uri"] == "/test/lancedb"
+            assert call_args["collection_name"] == "test_collection"
+            assert call_args["embedding_model"] == "test-embedding"
+            assert call_args["hybrid"] is False
+            assert call_args["dense_dim"] == 768
+
+    @patch("nvidia_rag.utils.vdb.get_metadata_configuration")
+    def test_get_vdb_op_lancedb_with_custom_metadata(self, mock_get_metadata_config):
+        """Test _get_vdb_op with LanceDB with custom metadata"""
+        mock_config = Mock()
+        mock_config.vector_store.name = "lancedb"
+        mock_config.vector_store.url = "/path/to/lancedb"
+        mock_config.vector_store.search_type = "hybrid"
+        mock_config.embeddings.dimensions = 1024
+
+        mock_get_metadata_config.return_value = (
+            "/path/to/metadata.csv",
+            "source_field",
+            ["field1", "field2"],
+        )
+
+        with patch(
+            "nvidia_rag.utils.vdb.lancedb.lancedb_vdb.LanceDBVDB"
+        ) as mock_lancedb_vdb:
+            mock_vdb_instance = Mock()
+            mock_lancedb_vdb.return_value = mock_vdb_instance
+
+            result = _get_vdb_op(
+                vdb_endpoint="/test/lancedb",
+                collection_name="test_collection",
+                custom_metadata=[{"field": "value"}],
+                all_file_paths=["/path/to/file1.pdf"],
+                embedding_model="test-embedding",
+                config=mock_config,
+            )
+
+            assert result == mock_vdb_instance
+            mock_lancedb_vdb.assert_called_once()
+            call_args = mock_lancedb_vdb.call_args[1]
+            assert call_args["db_uri"] == "/test/lancedb"
+            assert call_args["collection_name"] == "test_collection"
+            assert call_args["hybrid"] is True
+            assert call_args["dense_dim"] == 1024
+            assert call_args["meta_dataframe"] == "/path/to/metadata.csv"
+            assert call_args["meta_source_field"] == "source_field"
+            assert call_args["meta_fields"] == ["field1", "field2"]
+
+    @patch("nvidia_rag.utils.vdb.get_metadata_configuration")
+    def test_get_vdb_op_lancedb_uses_config_url_when_endpoint_none(
+        self, mock_get_metadata_config
+    ):
+        """Test _get_vdb_op with LanceDB uses config URL when endpoint is None"""
+        mock_config = Mock()
+        mock_config.vector_store.name = "lancedb"
+        mock_config.vector_store.url = "/config/lancedb"
+        mock_config.vector_store.search_type = "dense"
+        mock_config.embeddings.dimensions = 768
+
+        mock_get_metadata_config.return_value = (None, None, None)
+
+        with patch(
+            "nvidia_rag.utils.vdb.lancedb.lancedb_vdb.LanceDBVDB"
+        ) as mock_lancedb_vdb:
+            mock_vdb_instance = Mock()
+            mock_lancedb_vdb.return_value = mock_vdb_instance
+
+            result = _get_vdb_op(
+                vdb_endpoint=None,
+                collection_name="test_collection",
+                config=mock_config,
+            )
+
+            assert result == mock_vdb_instance
+            call_args = mock_lancedb_vdb.call_args[1]
+            assert call_args["db_uri"] == "/config/lancedb"
+
+    @patch("nvidia_rag.utils.vdb.get_metadata_configuration")
     def test_get_vdb_op_invalid_vector_store(self, mock_get_metadata_config):
         """Test _get_vdb_op with invalid vector store name raises ValueError"""
         mock_config = Mock()

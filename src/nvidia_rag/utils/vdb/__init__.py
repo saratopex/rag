@@ -120,5 +120,20 @@ def _get_vdb_op(
             config=config,
         )
 
+    elif config.vector_store.name == "lancedb":
+        from nvidia_rag.utils.vdb.lancedb.lancedb_vdb import LanceDBVDB
+
+        return LanceDBVDB(
+            db_uri=vdb_endpoint or config.vector_store.url,
+            collection_name=collection_name,
+            embedding_model=embedding_model,
+            config=config,
+            hybrid=config.vector_store.search_type == SearchType.HYBRID,
+            dense_dim=config.embeddings.dimensions,
+            meta_dataframe=csv_file_path,
+            meta_source_field=meta_source_field,
+            meta_fields=meta_fields,
+        )
+
     else:
         raise ValueError(f"Invalid vector store name: {config.vector_store.name}")
