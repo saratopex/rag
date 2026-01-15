@@ -46,6 +46,9 @@ dependencies = [
 
 [project.optional-dependencies]
 rag = [
+    # nv-ingest dependencies (needed for VDB base class)
+    "nv-ingest-api==25.9.0",
+    "nv-ingest-client==25.9.0",
     "langchain-openai>=0.2,<1.0",
     "opentelemetry-api>=1.29,<2.0",
     "opentelemetry-exporter-otlp>=1.29,<2.0",
@@ -63,8 +66,8 @@ rag = [
 ]
 ingest = [
     # nv-ingest dependencies (required for ingestion operations)
-    "nv-ingest-api==26.1.0rc5",
-    "nv-ingest-client==26.1.0rc5",
+    "nv-ingest-api==25.9.0",
+    "nv-ingest-client==25.9.0",
     "tritonclient==2.57.0",
     # Other ingest dependencies
     "langchain-openai>=0.2,<1.0",
@@ -84,9 +87,9 @@ ingest = [
 ]
 all = [
     # nv-ingest dependencies (required for ingestion operations)
-    "nv-ingest==26.1.0rc5",
-    "nv-ingest-api==26.1.0rc5",
-    "nv-ingest-client==26.1.0rc5",
+    "nv-ingest==25.9.0",
+    "nv-ingest-api==25.9.0",
+    "nv-ingest-client==25.9.0",
     "tritonclient==2.57.0",
     # RAG + Ingest dependencies
     "langchain-openai>=0.2,<1.0",

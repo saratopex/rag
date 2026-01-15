@@ -24,10 +24,10 @@ logging.basicConfig(level=os.environ.get("LOGLEVEL", "INFO").upper(), force=True
 logger = logging.getLogger(__name__)
 try:
     from .rag_server.main import NvidiaRAG
-except (ModuleNotFoundError, ImportError) as e:
+except ModuleNotFoundError as e:
     logger.debug(f"Error importing NvidiaRAG: {e}")
 
 try:
     from .ingestor_server.main import NvidiaRAGIngestor
-except (ModuleNotFoundError, ImportError) as e:
+except ModuleNotFoundError as e:
     logger.debug(f"Error importing NvidiaRAGIngestor: {e}")
