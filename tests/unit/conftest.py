@@ -53,6 +53,7 @@ fake_minio_operator.get_unique_thumbnail_id_file_name_prefix = (
     mock_minio_operator_methods
 )
 fake_minio_operator.get_unique_thumbnail_id = mock_minio_operator_methods
+fake_minio_operator.get_unique_thumbnail_id_from_result = mock_minio_operator_methods
 fake_minio_operator.MinioOperator = MagicMock()
 # Temporarily inject the fake module into sys.modules
 sys.modules["nvidia_rag.utils.minio_operator"] = fake_minio_operator

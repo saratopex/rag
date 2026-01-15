@@ -22,6 +22,8 @@ from nvidia_rag.utils.common import get_config, get_metadata_configuration
 
 CONFIG = get_config()
 DEFAULT_METADATA_SCHEMA_COLLECTION = "metadata_schema"
+DEFAULT_DOCUMENT_INFO_COLLECTION = "document_info"
+SYSTEM_COLLECTIONS = [DEFAULT_METADATA_SCHEMA_COLLECTION, DEFAULT_DOCUMENT_INFO_COLLECTION]
 
 
 def _get_vdb_op(

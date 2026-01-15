@@ -91,10 +91,6 @@ def get_minio_operator_instance():
     return MINIO_OPERATOR
 
 
-get_minio_operator_instance()._make_bucket(
-    bucket_name="a-bucket"
-)  # Create a-bucket if not exists
-
 # NV-Ingest Batch Mode Configuration
 ENABLE_NV_INGEST_BATCH_MODE = (
     os.getenv("ENABLE_NV_INGEST_BATCH_MODE", "true").lower() == "true"
