@@ -67,13 +67,9 @@ from langchain_core.documents import Document
 from langchain_core.runnables import RunnableAssign, RunnableLambda
 from opentelemetry import context as otel_context
 
-from nvidia_rag.rag_server.response_generator import APIError, ErrorCodeMapping
-from nvidia_rag.utils.common import (
-    get_current_timestamp,
-    perform_document_info_aggregation,
-)
-from nvidia_rag.utils.configuration import NvidiaRAGConfig, SearchType
-from nvidia_rag.utils.health_models import ServiceStatus
+from nvidia_rag.rag_server.main import APIError
+from nvidia_rag.rag_server.response_generator import ErrorCodeMapping
+from nvidia_rag.utils.configuration import AppConfig
 from nvidia_rag.utils.vdb import (
     DEFAULT_DOCUMENT_INFO_COLLECTION,
     DEFAULT_METADATA_SCHEMA_COLLECTION,
@@ -82,6 +78,35 @@ from nvidia_rag.utils.vdb import (
 from nvidia_rag.utils.vdb.vdb_ingest_base import VDBRagIngest
 
 logger = logging.getLogger(__name__)
+
+
+def _get_current_timestamp() -> str:
+    """Get the current timestamp in ISO format."""
+    from datetime import datetime, UTC
+    return datetime.now(UTC).isoformat()
+
+
+def _perform_document_info_aggregation(
+    existing_info: dict[str, Any],
+    new_info: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Aggregate document info by merging existing and new info.
+    For numeric values, sum them; for lists, extend them; otherwise replace.
+    """
+    result = existing_info.copy()
+    for key, value in new_info.items():
+        if key in result:
+            if isinstance(value, (int, float)) and isinstance(result[key], (int, float)):
+                result[key] = result[key] + value
+            elif isinstance(value, list) and isinstance(result[key], list):
+                result[key] = result[key] + value
+            else:
+                result[key] = value
+        else:
+            result[key] = value
+    return result
+
 
 # LanceDB table names for system collections
 LANCEDB_METADATA_SCHEMA_TABLE = DEFAULT_METADATA_SCHEMA_COLLECTION
@@ -107,7 +132,7 @@ class LanceDBVDB(VDBRagIngest):
         db_uri: str,
         collection_name: str = "",
         embedding_model: Any = None,
-        config: NvidiaRAGConfig | None = None,
+        config: AppConfig | None = None,
         # Hybrid search configurations
         hybrid: bool = False,
         # Dimension of dense embeddings
@@ -128,7 +153,7 @@ class LanceDBVDB(VDBRagIngest):
                 - Azure: "az://container/path"
             collection_name: Name of the collection/table
             embedding_model: Embedding model instance for retrieval
-            config: NvidiaRAGConfig instance (optional, creates default if None)
+            config: AppConfig instance (optional, creates default if None)
             hybrid: Enable hybrid search (not yet supported in LanceDB langchain)
             dense_dim: Dimension of dense embeddings
             meta_dataframe: Path to CSV file containing custom metadata
@@ -143,7 +168,7 @@ class LanceDBVDB(VDBRagIngest):
                 "Install with: pip install lancedb"
             ) from e
 
-        self.config = config or NvidiaRAGConfig()
+        self.config = config or AppConfig()
         self._db_uri = db_uri
         self._collection_name = collection_name
         self._embedding_model = embedding_model
@@ -351,23 +376,23 @@ class LanceDBVDB(VDBRagIngest):
         status = {
             "service": "LanceDB",
             "url": self._db_uri,
-            "status": ServiceStatus.UNKNOWN.value,
+            "status": "unknown",
             "error": None,
         }
 
         if not self._db_uri:
-            status["status"] = ServiceStatus.SKIPPED.value
+            status["status"] = "skipped"
             status["error"] = "No URI provided"
             return status
 
         try:
             start_time = time.time()
             tables = self._db.table_names()
-            status["status"] = ServiceStatus.HEALTHY.value
+            status["status"] = "healthy"
             status["latency_ms"] = round((time.time() - start_time) * 1000, 2)
             status["tables"] = len(tables)
         except Exception as e:
-            status["status"] = ServiceStatus.ERROR.value
+            status["status"] = "error"
             status["error"] = str(e)
 
         return status
@@ -694,7 +719,7 @@ class LanceDBVDB(VDBRagIngest):
             logger.error(f"Error getting aggregated document info: {e}")
             return info_value
 
-        return perform_document_info_aggregation(existing_info, info_value)
+        return _perform_document_info_aggregation(existing_info, info_value)
 
     def add_document_info(
         self,
@@ -781,7 +806,7 @@ class LanceDBVDB(VDBRagIngest):
         """Update catalog metadata for a collection."""
         existing = self.get_catalog_metadata(collection_name)
         merged = {**existing, **updates}
-        merged["last_updated"] = get_current_timestamp()
+        merged["last_updated"] = _get_current_timestamp()
 
         self.add_document_info(
             info_type="catalog",
