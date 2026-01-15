@@ -16,124 +16,106 @@
 import os
 from typing import Any
 
-from nvidia_rag.utils.common import get_metadata_configuration
-from nvidia_rag.utils.configuration import NvidiaRAGConfig, SearchType
+from nv_ingest_client.util.milvus import pandas_file_reader
 
+from nvidia_rag.utils.common import get_config, get_metadata_configuration
+
+CONFIG = get_config()
 DEFAULT_METADATA_SCHEMA_COLLECTION = "metadata_schema"
-DEFAULT_DOCUMENT_INFO_COLLECTION = "document_info"
-SYSTEM_COLLECTIONS = [
-    DEFAULT_METADATA_SCHEMA_COLLECTION,
-    DEFAULT_DOCUMENT_INFO_COLLECTION,
-    "meta",
-]
 
 
 def _get_vdb_op(
     vdb_endpoint: str,
     collection_name: str = "",
-    custom_metadata: list[dict[str, Any]] | None = None,
-    all_file_paths: list[str] | None = None,
-    embedding_model: str | None = None,  # Needed in case of retrieval
-    metadata_schema: list[dict[str, Any]] | None = None,
-    config: NvidiaRAGConfig | None = None,
-    vdb_auth_token: str | None = None,
+    custom_metadata: list[dict[str, Any]] = None,
+    all_file_paths: list[str] = None,
+    embedding_model: str = None,  # Needed in case of retrieval
 ):
     """
-    Get VDBRag class object based on configuration.
-
-    Args:
-        vdb_endpoint: Vector database endpoint URL
-        collection_name: Name of the collection
-        custom_metadata: Custom metadata configuration
-        all_file_paths: List of file paths for metadata
-        embedding_model: Embedding model instance for retrieval
-        metadata_schema: Metadata schema definition
-        config: NvidiaRAGConfig instance. If None, creates a new one.
+    Get VDBRag class object based on the environment variables.
     """
-    if config is None:
-        config = NvidiaRAGConfig()
-
     # Get metadata configuration
     csv_file_path, meta_source_field, meta_fields = get_metadata_configuration(
         collection_name=collection_name,
         custom_metadata=custom_metadata,
         all_file_paths=all_file_paths,
-        metadata_schema=metadata_schema,
-        config=config,
     )
 
-    # Get VDBRag class object based on the configuration
-    if config.vector_store.name == "milvus":
+    # Get VDBRag class object based on the environment variables.
+    if CONFIG.vector_store.name == "milvus":
         from nvidia_rag.utils.vdb.milvus.milvus_vdb import MilvusVDB
 
-        return MilvusVDB(
+        vdb_upload_kwargs = {
             # Milvus configurations
-            collection_name=collection_name,
-            milvus_uri=vdb_endpoint or config.vector_store.url,
-            embedding_model=embedding_model,
-            config=config,
+            "collection_name": collection_name,
+            "milvus_uri": vdb_endpoint or CONFIG.vector_store.url,
             # Minio configurations
-            minio_endpoint=os.getenv("MINIO_ENDPOINT"),
-            access_key=os.getenv("MINIO_ACCESSKEY"),
-            secret_key=os.getenv("MINIO_SECRETKEY"),
-            bucket_name=os.getenv("NVINGEST_MINIO_BUCKET", "nv-ingest"),
+            "minio_endpoint": os.getenv("MINIO_ENDPOINT"),
+            "access_key": os.getenv("MINIO_ACCESSKEY"),
+            "secret_key": os.getenv("MINIO_SECRETKEY"),
+            "bucket_name": os.getenv("NVINGEST_MINIO_BUCKET", "nv-ingest"),
             # Hybrid search configurations
-            sparse=(config.vector_store.search_type == SearchType.HYBRID),
+            "sparse": (CONFIG.vector_store.search_type == "hybrid"),
             # Additional configurations
-            enable_images=(
-                config.nv_ingest.extract_images
-                or config.nv_ingest.extract_page_as_image
+            "enable_images": (
+                CONFIG.nv_ingest.extract_images
+                or CONFIG.nv_ingest.extract_page_as_image
             ),
-            recreate=False,  # Don't re-create milvus collection
-            dense_dim=config.embeddings.dimensions,
+            "recreate": False,  # Don't re-create milvus collection
+            "dense_dim": CONFIG.embeddings.dimensions,
             # GPU configurations
-            gpu_index=config.vector_store.enable_gpu_index,
-            gpu_search=config.vector_store.enable_gpu_search,
-            # Authentication for Milvus
-            username=config.vector_store.username,
-            password=(
-                config.vector_store.password.get_secret_value()
-                if config.vector_store.password is not None
-                else ""
-            ),
-            # Custom metadata configurations (optional)
-            meta_dataframe=csv_file_path,
-            meta_source_field=meta_source_field,
-            meta_fields=meta_fields,
-            auth_token=vdb_auth_token,
-        )
+            "gpu_index": CONFIG.vector_store.enable_gpu_index,
+            "gpu_search": CONFIG.vector_store.enable_gpu_search,
+            "embedding_model": embedding_model,
+        }
+        if csv_file_path is not None:
+            # Add custom metadata configurations
+            vdb_upload_kwargs.update(
+                {
+                    "meta_dataframe": csv_file_path,
+                    "meta_source_field": meta_source_field,
+                    "meta_fields": meta_fields,
+                }
+            )
+        return MilvusVDB(**vdb_upload_kwargs)
 
-    elif config.vector_store.name == "elasticsearch":
+    elif CONFIG.vector_store.name == "elasticsearch":
         from nvidia_rag.utils.vdb.elasticsearch.elastic_vdb import ElasticVDB
 
-        # Note: meta_dataframe is loaded lazily inside ElasticVDB.write_to_index()
-        # when actually needed for ingestion. This allows search to work without nv_ingest.
+        if csv_file_path is not None:
+            meta_dataframe = pandas_file_reader(csv_file_path)
+        else:
+            meta_dataframe = None
+
         return ElasticVDB(
             index_name=collection_name,
-            es_url=vdb_endpoint or config.vector_store.url,
-            hybrid=config.vector_store.search_type == SearchType.HYBRID,
-            auth_token=vdb_auth_token,
+            es_url=vdb_endpoint or CONFIG.vector_store.url,
+            hybrid=CONFIG.vector_store.search_type == "hybrid",
+            meta_dataframe=meta_dataframe,
             meta_source_field=meta_source_field,
             meta_fields=meta_fields,
             embedding_model=embedding_model,
             csv_file_path=csv_file_path,
-            config=config,
         )
 
-    elif config.vector_store.name == "lancedb":
+    elif CONFIG.vector_store.name == "lancedb":
         from nvidia_rag.utils.vdb.lancedb.lancedb_vdb import LanceDBVDB
 
+        if csv_file_path is not None:
+            meta_dataframe = pandas_file_reader(csv_file_path)
+        else:
+            meta_dataframe = None
+
         return LanceDBVDB(
-            db_uri=vdb_endpoint or config.vector_store.url,
+            db_uri=vdb_endpoint or CONFIG.vector_store.url,
             collection_name=collection_name,
             embedding_model=embedding_model,
-            config=config,
-            hybrid=config.vector_store.search_type == SearchType.HYBRID,
-            dense_dim=config.embeddings.dimensions,
-            meta_dataframe=csv_file_path,
+            hybrid=CONFIG.vector_store.search_type == "hybrid",
+            dense_dim=CONFIG.embeddings.dimensions,
+            meta_dataframe=meta_dataframe,
             meta_source_field=meta_source_field,
             meta_fields=meta_fields,
         )
 
     else:
-        raise ValueError(f"Invalid vector store name: {config.vector_store.name}")
+        raise ValueError(f"Invalid vector store name: {CONFIG.vector_store.name}")
