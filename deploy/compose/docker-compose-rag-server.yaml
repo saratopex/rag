@@ -13,6 +13,8 @@ services:
     volumes:
       # Mount the prompt.yaml file to the container, path should be absolute
       - ${PROMPT_CONFIG_FILE}:${PROMPT_CONFIG_FILE}
+      # Mount host's LanceDB data (used when APP_VECTORSTORE_NAME=lancedb)
+      - ${LANCEDB_DATA_PATH:-/tmp/lancedb_data}:/tmp/lancedb_data
     # Common customizations to the pipeline can be controlled using env variables
     environment:
       # Path to example directory relative to root

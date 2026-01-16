@@ -24,11 +24,16 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV DEBIAN_FRONTEND noninteractive
 
 # Install required ubuntu packages for setting up python 3.13
-RUN apt update && \
-    apt install -y curl software-properties-common libgl1 libglib2.0-0 libmagic1 file build-essential && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt update && apt install -y python3.13 python3.13-dev && \
-    apt-get clean
+# Add deadsnakes PPA manually - fetch GPG key via HTTPS to avoid keyserver issues
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg libgl1 libglib2.0-0 libmagic1 file build-essential && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776" | gpg --dearmor -o /etc/apt/keyrings/deadsnakes.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu jammy main" > /etc/apt/sources.list.d/deadsnakes.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends python3.13 python3.13-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install uv https://docs.astral.sh/uv/guides/integration/docker/#installing-uv
 COPY --from=ghcr.io/astral-sh/uv:0.8.12 /uv /uvx /bin/

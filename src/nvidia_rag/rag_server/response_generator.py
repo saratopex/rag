@@ -23,6 +23,7 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -533,7 +534,7 @@ def generate_answer(
             e,
             exc_info=logger.getEffectiveLevel() <= logging.DEBUG,
         )
-        yield error_response_generator(exception_msg)
+        yield from error_response_generator(exception_msg)
 
     except Exception as e:
         logger.error(
@@ -541,7 +542,7 @@ def generate_answer(
             e,
             exc_info=logger.getEffectiveLevel() <= logging.DEBUG,
         )
-        yield error_response_generator(FALLBACK_EXCEPTION_MSG)
+        yield from error_response_generator(FALLBACK_EXCEPTION_MSG)
 
 
 def prepare_citations(
@@ -564,19 +565,33 @@ def prepare_citations(
         for doc in retrieved_documents:
             content = ""
             document_type = ""
-            if isinstance(doc.metadata.get("source"), str):
+            source = doc.metadata.get("source")
+            if isinstance(source, str):
                 # If langchain is used for ingestion, the source is a string
-                file_name = os.path.basename(doc.metadata.get("source"))
+                # It could be a JSON string or a plain path
+                if source.startswith("{"):
+                    try:
+                        source_dict = json.loads(source)
+                        file_name = os.path.basename(
+                            source_dict.get("source_name", source_dict.get("source_id", "unknown"))
+                        )
+                    except json.JSONDecodeError:
+                        file_name = os.path.basename(source)
+                else:
+                    file_name = os.path.basename(source)
                 content = doc.page_content
                 source_metadata = SourceMetadata(
                     description=doc.page_content,
                     content_metadata=doc.metadata.get("content_metadata", {}),
                 )
                 document_type = "text"
-            else:
+            elif isinstance(source, dict):
                 file_name = os.path.basename(
-                    doc.metadata.get("source").get("source_id")
+                    source.get("source_name", source.get("source_id", "unknown"))
                 )
+            else:
+                # source is None or unexpected type
+                file_name = "unknown"
 
             if doc.metadata.get("content_metadata", {}).get("type") in [
                 "text",

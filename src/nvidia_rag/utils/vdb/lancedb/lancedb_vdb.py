@@ -926,10 +926,9 @@ class LanceDBVDB(VDBRagIngest):
         if not self._table_exists(collection_name):
             raise ValueError(f"Table {collection_name} does not exist in LanceDB")
 
-        table = self._db.open_table(collection_name)
-
         vectorstore = LangchainLanceDB(
-            connection=table,
+            connection=self._db,
+            table_name=collection_name,
             embedding=self._embedding_model,
             text_key="text",
             vector_key="vector",
